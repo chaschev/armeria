@@ -47,8 +47,6 @@ import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.MediaType;
-import com.linecorp.armeria.common.RpcRequest;
-import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.metric.MeterIdPrefix;
 import com.linecorp.armeria.common.metric.MeterIdPrefixFunction;
@@ -84,12 +82,10 @@ public class PrometheusMetricsIntegrationTest {
             });
 
             sb.service("/foo", helloService.decorate(
-                    MetricCollectingService.newDecorator(
-                            (registry, log) -> meterIdPrefix(registry, log, "server", "Foo"))));
+                    MetricCollectingService.newDecorator(new MeterIdPrefixFunctionImpl("server", "Foo"))));
 
             sb.service("/bar", helloService.decorate(
-                    MetricCollectingService.newDecorator(
-                            (registry, log) -> meterIdPrefix(registry, log, "server", "Bar"))));
+                    MetricCollectingService.newDecorator(new MeterIdPrefixFunctionImpl("server", "Bar"))));
 
             sb.service("/internal/prometheus/metrics",
                        new PrometheusExpositionService(prometheusRegistry));
@@ -123,7 +119,7 @@ public class PrometheusMetricsIntegrationTest {
         makeRequest1("world");
 
         // Wait until all RequestLogs are collected.
-        await().untilAsserted(() -> assertThat(makeMetricsRequest().content().toStringUtf8())
+        await().untilAsserted(() -> assertThat(makeMetricsRequest().contentUtf8())
                 .contains("server_active_requests{handler=\"Foo\"",
                           "server_active_requests{handler=\"Foo\"",
                           "server_requests_total{handler=\"Foo\",",
@@ -150,7 +146,7 @@ public class PrometheusMetricsIntegrationTest {
                           "client_total_duration_seconds_count{handler=\"Foo\",",
                           "client_total_duration_seconds_sum{handler=\"Foo\","));
 
-        final String content = makeMetricsRequest().content().toStringUtf8();
+        final String content = makeMetricsRequest().contentUtf8();
         logger.debug("Metrics reported by the exposition service:\n{}", content);
 
         // Server entry count check
@@ -213,7 +209,7 @@ public class PrometheusMetricsIntegrationTest {
         makeRequest2("world");
 
         // Wait until all RequestLogs are collected.
-        await().untilAsserted(() -> assertThat(makeMetricsRequest().content().toStringUtf8())
+        await().untilAsserted(() -> assertThat(makeMetricsRequest().contentUtf8())
                 .contains("server_active_requests{handler=\"Bar\"",
                           "server_active_requests{handler=\"Bar\"",
                           "server_requests_total{handler=\"Bar\",",
@@ -240,7 +236,7 @@ public class PrometheusMetricsIntegrationTest {
                           "client_total_duration_seconds_count{handler=\"Bar\",",
                           "client_total_duration_seconds_sum{handler=\"Bar\","));
 
-        final String content = makeMetricsRequest().content().toStringUtf8();
+        final String content = makeMetricsRequest().contentUtf8();
 
         // Server entry count check
         assertThat(content).containsPattern(
@@ -298,9 +294,8 @@ public class PrometheusMetricsIntegrationTest {
     private static void makeRequest(String path, String serviceName, String name) throws TException {
         final Iface client = new ClientBuilder(server.uri(BINARY, path))
                 .factory(clientFactory)
-                .decorator(RpcRequest.class, RpcResponse.class,
-                           MetricCollectingClient.newDecorator(
-                                   (registry, log) -> meterIdPrefix(registry, log, "client", serviceName)))
+                .rpcDecorator(MetricCollectingClient.newDecorator(
+                        new MeterIdPrefixFunctionImpl("client", serviceName)))
                 .build(Iface.class);
         client.hello(name);
     }
@@ -313,13 +308,6 @@ public class PrometheusMetricsIntegrationTest {
                      .aggregate().get();
     }
 
-    private static MeterIdPrefix meterIdPrefix(MeterRegistry registry, RequestLog log,
-                                               String name, String serviceName) {
-        return MeterIdPrefixFunction.ofDefault(name)
-                                    .withTags("handler", serviceName)
-                                    .apply(registry, log);
-    }
-
     private static Pattern multilinePattern(String... lines) {
         final StringBuilder buf = new StringBuilder();
 
@@ -330,5 +318,30 @@ public class PrometheusMetricsIntegrationTest {
         buf.append('$');
 
         return Pattern.compile(buf.toString(), Pattern.MULTILINE);
+    }
+
+    private static final class MeterIdPrefixFunctionImpl implements MeterIdPrefixFunction {
+
+        private final String name;
+        private final String serviceName;
+
+        MeterIdPrefixFunctionImpl(String name, String serviceName) {
+            this.name = name;
+            this.serviceName = serviceName;
+        }
+
+        @Override
+        public MeterIdPrefix apply(MeterRegistry registry, RequestLog log) {
+            return MeterIdPrefixFunction.ofDefault(name)
+                                        .withTags("handler", serviceName)
+                                        .apply(registry, log);
+        }
+
+        @Override
+        public MeterIdPrefix activeRequestPrefix(MeterRegistry registry, RequestLog log) {
+            return MeterIdPrefixFunction.ofDefault(name)
+                                        .withTags("handler", serviceName)
+                                        .activeRequestPrefix(registry, log);
+        }
     }
 }

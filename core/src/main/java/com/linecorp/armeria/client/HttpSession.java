@@ -29,10 +29,6 @@ import io.netty.channel.ChannelHandler;
 interface HttpSession {
 
     HttpSession INACTIVE = new HttpSession() {
-
-        private final InboundTrafficController inboundTrafficController =
-                new InboundTrafficController(null, 0, 0);
-
         @Nullable
         @Override
         public SessionProtocol protocol() {
@@ -40,18 +36,18 @@ interface HttpSession {
         }
 
         @Override
-        public boolean isActive() {
+        public boolean canSendRequest() {
             return false;
         }
 
         @Override
         public InboundTrafficController inboundTrafficController() {
-            return inboundTrafficController;
+            return InboundTrafficController.disabled();
         }
 
         @Override
-        public boolean hasUnfinishedResponses() {
-            return false;
+        public int unfinishedResponses() {
+            return 0;
         }
 
         @Override
@@ -74,24 +70,25 @@ interface HttpSession {
         if (lastHandler instanceof HttpSession) {
             return (HttpSession) lastHandler;
         }
-
-        for (ChannelHandler h : ch.pipeline().toMap().values()) {
-            if (h instanceof HttpSession) {
-                return (HttpSession) h;
-            }
-        }
-
         return INACTIVE;
     }
 
     @Nullable
     SessionProtocol protocol();
 
-    boolean isActive();
+    boolean canSendRequest();
 
     InboundTrafficController inboundTrafficController();
 
-    boolean hasUnfinishedResponses();
+    int unfinishedResponses();
+
+    default boolean hasUnfinishedResponses() {
+        return unfinishedResponses() != 0;
+    }
+
+    default int maxUnfinishedResponses() {
+        return Integer.MAX_VALUE;
+    }
 
     boolean invoke(ClientRequestContext ctx, HttpRequest req, DecodedHttpResponse res);
 

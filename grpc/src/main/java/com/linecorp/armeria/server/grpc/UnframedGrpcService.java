@@ -16,12 +16,12 @@
 
 package com.linecorp.armeria.server.grpc;
 
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
-
-import com.google.common.collect.ImmutableMap;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
 import com.linecorp.armeria.common.HttpData;
@@ -32,12 +32,12 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.Listener;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageFramer;
-import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcStatus;
 import com.linecorp.armeria.server.PathMapping;
 import com.linecorp.armeria.server.Service;
@@ -87,11 +87,11 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
                         .orElseThrow(
                                 () -> new IllegalArgumentException("Decorated service must be a GrpcService."));
         methodsByName = delegateGrpcService.services()
-                                   .stream()
-                                   .flatMap(service -> service.getMethods().stream())
-                                   .map(ServerMethodDefinition::getMethodDescriptor)
-                                   .collect(ImmutableMap.toImmutableMap(MethodDescriptor::getFullMethodName,
-                                                                        Function.identity()));
+                                           .stream()
+                                           .flatMap(service -> service.getMethods().stream())
+                                           .map(ServerMethodDefinition::getMethodDescriptor)
+                                           .collect(toImmutableMap(MethodDescriptor::getFullMethodName,
+                                                                   Function.identity()));
     }
 
     @Override
@@ -152,14 +152,14 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
         ctx.logBuilder().deferResponseContent();
 
         final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
-        req.aggregateWithPooledObjects(ctx.eventLoop(), ctx.alloc()).whenComplete(
-                (clientRequest, t) -> {
-                    if (t != null) {
-                        responseFuture.completeExceptionally(t);
-                    } else {
-                        frameAndServe(ctx, grpcHeaders, clientRequest, responseFuture);
-                    }
-                });
+        req.aggregateWithPooledObjects(ctx.eventLoop(), ctx.alloc()).handle((clientRequest, t) -> {
+            if (t != null) {
+                responseFuture.completeExceptionally(t);
+            } else {
+                frameAndServe(ctx, grpcHeaders, clientRequest, responseFuture);
+            }
+            return null;
+        });
         return HttpResponse.from(responseFuture);
     }
 
@@ -200,13 +200,14 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
             return;
         }
 
-        grpcResponse.aggregate().whenCompleteAsync(
+        grpcResponse.aggregate().handleAsync(
                 (framedResponse, t) -> {
                     if (t != null) {
                         res.completeExceptionally(t);
                     } else {
                         deframeAndRespond(ctx, framedResponse, res);
                     }
+                    return null;
                 },
                 ctx.eventLoop());
     }
@@ -241,7 +242,7 @@ class UnframedGrpcService extends SimpleDecoratingService<HttpRequest, HttpRespo
             return;
         }
 
-        final MediaType grpcMediaType = grpcResponse.headers().contentType();
+        final MediaType grpcMediaType = grpcResponse.contentType();
         final HttpHeaders unframedHeaders = HttpHeaders.copyOf(grpcResponse.headers());
         if (grpcMediaType != null) {
             if (grpcMediaType.is(GrpcSerializationFormats.PROTO.mediaType())) {

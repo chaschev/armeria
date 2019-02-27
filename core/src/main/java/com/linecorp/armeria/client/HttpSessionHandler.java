@@ -60,7 +60,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
      */
     private static final int MAX_NUM_REQUESTS_SENT = 536870912;
 
-    private final HttpSessionChannelFactory channelFactory;
+    private final HttpChannelPool channelPool;
     private final Channel channel;
     private final Promise<Channel> sessionPromise;
     private final ScheduledFuture<?> sessionTimeoutFuture;
@@ -82,6 +82,12 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
     private HttpObjectEncoder requestEncoder;
 
     /**
+     * The maximum number of unfinished requests. In HTTP/2, this value is identical to MAX_CONCURRENT_STREAMS.
+     * In HTTP/1, this value stays at {@link Integer#MAX_VALUE}.
+     */
+    private int maxUnfinishedResponses = Integer.MAX_VALUE;
+
+    /**
      * The number of requests sent. Disconnects when it reaches at {@link #MAX_NUM_REQUESTS_SENT}.
      */
     private int numRequestsSent;
@@ -92,10 +98,10 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
      */
     private boolean needsRetryWithH1C;
 
-    HttpSessionHandler(HttpSessionChannelFactory channelFactory, Channel channel,
+    HttpSessionHandler(HttpChannelPool channelPool, Channel channel,
                        Promise<Channel> sessionPromise, ScheduledFuture<?> sessionTimeoutFuture) {
 
-        this.channelFactory = requireNonNull(channelFactory, "channelFactory");
+        this.channelPool = requireNonNull(channelPool, "channelPool");
         this.channel = requireNonNull(channel, "channel");
         this.sessionPromise = requireNonNull(sessionPromise, "sessionPromise");
         this.sessionTimeoutFuture = requireNonNull(sessionTimeoutFuture, "sessionTimeoutFuture");
@@ -113,14 +119,20 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
     }
 
     @Override
-    public boolean hasUnfinishedResponses() {
+    public int unfinishedResponses() {
         assert responseDecoder != null;
-        return responseDecoder.hasUnfinishedResponses();
+        return responseDecoder.unfinishedResponses();
     }
 
     @Override
-    public boolean isActive() {
-        return active;
+    public int maxUnfinishedResponses() {
+        return maxUnfinishedResponses;
+    }
+
+    @Override
+    public boolean canSendRequest() {
+        assert responseDecoder != null;
+        return active && !responseDecoder.needsToDisconnectWhenFinished();
     }
 
     @Override
@@ -167,19 +179,21 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
         req.abort();
         ctx.logBuilder().startRequest(channel, protocol);
         ctx.logBuilder().requestHeaders(req.headers());
-        req.completionFuture().whenComplete((unused, cause) -> {
+        req.completionFuture().handle((unused, cause) -> {
             if (cause == null) {
                 ctx.logBuilder().endRequest();
             } else {
                 ctx.logBuilder().endRequest(cause);
             }
+            return null;
         });
-        res.completionFuture().whenComplete((unused, cause) -> {
+        res.completionFuture().handle((unused, cause) -> {
             if (cause == null) {
                 ctx.logBuilder().endResponse();
             } else {
                 ctx.logBuilder().endResponse(cause);
             }
+            return null;
         });
 
         return true;
@@ -197,7 +211,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) throws Exception {
-        active = ctx.channel().isActive();
+        active = channel.isActive();
     }
 
     @Override
@@ -208,19 +222,28 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof Http2Settings) {
-            // Expected
-        } else {
-            try {
-                final String typeInfo;
-                if (msg instanceof ByteBuf) {
-                    typeInfo = msg + " HexDump: " + ByteBufUtil.hexDump((ByteBuf) msg);
-                } else {
-                    typeInfo = String.valueOf(msg);
-                }
-                throw new IllegalStateException("unexpected message type: " + typeInfo);
-            } finally {
-                ReferenceCountUtil.release(msg);
+            final Long maxConcurrentStreams = ((Http2Settings) msg).maxConcurrentStreams();
+            if (maxConcurrentStreams != null) {
+                maxUnfinishedResponses =
+                        maxConcurrentStreams > Integer.MAX_VALUE ? Integer.MAX_VALUE
+                                                                 : maxConcurrentStreams.intValue();
+            } else {
+                maxUnfinishedResponses = Integer.MAX_VALUE;
             }
+            return;
+        }
+
+        // Handle an unexpected message by raising an exception with debugging information.
+        try {
+            final String typeInfo;
+            if (msg instanceof ByteBuf) {
+                typeInfo = msg + " HexDump: " + ByteBufUtil.hexDump((ByteBuf) msg);
+            } else {
+                typeInfo = String.valueOf(msg);
+            }
+            throw new IllegalStateException("unexpected message type: " + typeInfo);
+        } finally {
+            ReferenceCountUtil.release(msg);
         }
     }
 
@@ -236,17 +259,17 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
             final SessionProtocol protocol = (SessionProtocol) evt;
             this.protocol = protocol;
             if (protocol == H1 || protocol == H1C) {
-                requestEncoder = new Http1ObjectEncoder(false, protocol.isTls());
+                requestEncoder = new Http1ObjectEncoder(channel, false, protocol.isTls());
                 responseDecoder = ctx.pipeline().get(Http1ResponseDecoder.class);
             } else if (protocol == H2 || protocol == H2C) {
                 final Http2ConnectionHandler handler = ctx.pipeline().get(Http2ConnectionHandler.class);
-                requestEncoder = new Http2ObjectEncoder(handler.encoder());
+                requestEncoder = new Http2ObjectEncoder(ctx, handler.encoder());
                 responseDecoder = ctx.pipeline().get(Http2ClientConnectionHandler.class).responseDecoder();
             } else {
                 throw new Error(); // Should never reach here.
             }
 
-            if (!sessionPromise.trySuccess(ctx.channel())) {
+            if (!sessionPromise.trySuccess(channel)) {
                 // Session creation has been failed already; close the connection.
                 ctx.close();
             }
@@ -267,7 +290,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
             return;
         }
 
-        logger.warn("{} Unexpected user event: {}", ctx.channel(), evt);
+        logger.warn("{} Unexpected user event: {}", channel, evt);
     }
 
     @Override
@@ -278,7 +301,7 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
         if (needsRetryWithH1C) {
             assert responseDecoder == null || !responseDecoder.hasUnfinishedResponses();
             sessionTimeoutFuture.cancel(false);
-            channelFactory.connect(ctx.channel().remoteAddress(), H1C, sessionPromise);
+            channelPool.connect(channel.remoteAddress(), H1C, sessionPromise);
         } else {
             // Fail all pending responses.
             failUnfinishedResponses(ClosedSessionException.get());
@@ -292,8 +315,8 @@ final class HttpSessionHandler extends ChannelDuplexHandler implements HttpSessi
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-        Exceptions.logIfUnexpected(logger, ctx.channel(), protocol(), cause);
-        if (ctx.channel().isActive()) {
+        Exceptions.logIfUnexpected(logger, channel, protocol(), cause);
+        if (channel.isActive()) {
             ctx.close();
         }
     }

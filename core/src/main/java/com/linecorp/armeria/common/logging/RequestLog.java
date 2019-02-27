@@ -25,7 +25,10 @@ import java.util.Set;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
+import javax.net.ssl.SSLSession;
 
+import com.linecorp.armeria.client.Client;
+import com.linecorp.armeria.client.ClientBuilder;
 import com.linecorp.armeria.client.ClientRequestContext;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
@@ -38,6 +41,9 @@ import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.Scheme;
 import com.linecorp.armeria.common.SerializationFormat;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.server.ChainedVirtualHostBuilder;
+import com.linecorp.armeria.server.Server;
+import com.linecorp.armeria.server.ServerBuilder;
 
 import io.netty.channel.Channel;
 
@@ -170,6 +176,16 @@ public interface RequestLog {
     }
 
     /**
+     * Returns the absolute path part of the current {@link Request} URI, excluding the query part,
+     * decoded in UTF-8.
+     * This method is a shortcut to {@code context().decodedPath()}.
+     * This method returns non-{@code null} regardless the current {@link RequestLogAvailability}.
+     */
+    default String decodedPath() {
+        return context().decodedPath();
+    }
+
+    /**
      * Returns the query part of the {@link Request} URI, without the leading {@code '?'},
      * as defined in <a href="https://tools.ietf.org/html/rfc3986">RFC3986</a>.
      * This method is a shortcut to {@code context().query()}.
@@ -179,6 +195,13 @@ public interface RequestLog {
     default String query() {
         return context().query();
     }
+
+    /**
+     * Returns the time when the processing of the request started, in micros since the epoch.
+     *
+     * @throws RequestLogAvailabilityException if this property is not available yet
+     */
+    long requestStartTimeMicros();
 
     /**
      * Returns the time when the processing of the request started, in millis since the epoch.
@@ -194,6 +217,14 @@ public interface RequestLog {
      * @throws RequestLogAvailabilityException if this property is not available yet
      */
     long requestStartTimeNanos();
+
+    /**
+     * Returns the time when the first bytes of the request headers were transferred over the wire. For a
+     * client, this is the time the client sent the data, while for a server it is the time the server received
+     * them. This value can only be used to measure elapsed time and is not related to any other notion of
+     * system or wall-clock time.
+     */
+    long requestFirstBytesTransferredTimeNanos();
 
     /**
      * Returns the time when the processing of the request finished, in nanoseconds. This value can only be
@@ -227,6 +258,13 @@ public interface RequestLog {
     Throwable requestCause();
 
     /**
+     * Returns the time when the processing of the response started, in micros since the epoch.
+     *
+     * @throws RequestLogAvailabilityException if this property is not available yet
+     */
+    long responseStartTimeMicros();
+
+    /**
      * Returns the time when the processing of the response started, in millis since the epoch.
      *
      * @throws RequestLogAvailabilityException if this property is not available yet
@@ -240,6 +278,14 @@ public interface RequestLog {
      * @throws RequestLogAvailabilityException if this property is not available yet
      */
     long responseStartTimeNanos();
+
+    /**
+     * Returns the time when the first bytes of the response headers were transferred over the wire. For a
+     * client, this is the time the client received the data, while for a server it is the time the server sent
+     * them. This value can only be used to measure elapsed time and is not related to any other notion of
+     * system or wall-clock time.
+     */
+    long responseFirstBytesTransferredTimeNanos();
 
     /**
      * Returns the time when the processing of the response finished, in nanoseconds. This value can only be
@@ -292,6 +338,15 @@ public interface RequestLog {
      */
     @Nullable
     Channel channel();
+
+    /**
+     * Returns the {@link SSLSession} of the connection which handled the {@link Request}.
+     *
+     * @return the {@link SSLSession}, or {@code null} if the {@link Request} has failed even before
+     *         a TLS connection is established.
+     */
+    @Nullable
+    SSLSession sslSession();
 
     /**
      * Returns the {@link SessionProtocol} of the {@link Request}.
@@ -395,6 +450,23 @@ public interface RequestLog {
     Object requestContent();
 
     /**
+     * Returns the preview of response content of the {@link Request}.
+     * Note that the content preview needs to be enabled when configuring a {@link Server} or a {@link Client}
+     * to use this functionality.
+     *
+     * @return the preview, or {@code null} if preview is not available or disabled.
+     * @throws RequestLogAvailabilityException if this property is not available yet.
+     * @see ServerBuilder#contentPreview(int)
+     * @see ServerBuilder#requestContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ChainedVirtualHostBuilder#contentPreview(int)
+     * @see ChainedVirtualHostBuilder#requestContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ClientBuilder#requestContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ClientBuilder#contentPreview(int)
+     */
+    @Nullable
+    String requestContentPreview();
+
+    /**
      * Returns the low-level content object of the {@link Request}, which is specific
      * to the {@link SerializationFormat}.
      *
@@ -434,6 +506,23 @@ public interface RequestLog {
     Object rawResponseContent();
 
     /**
+     * Returns the preview of response content of the {@link Response}.
+     * Note that the content preview needs to be enabled when configuring a {@link Server} or a {@link Client}
+     * to use this functionality.
+     *
+     * @return the preview, or {@code null} if preview is not available or disabled.
+     * @throws RequestLogAvailabilityException if this property is not available yet.
+     * @see ServerBuilder#contentPreview(int)
+     * @see ServerBuilder#responseContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ChainedVirtualHostBuilder#contentPreview(int)
+     * @see ChainedVirtualHostBuilder#responseContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ClientBuilder#responseContentPreviewerFactory(ContentPreviewerFactory)
+     * @see ClientBuilder#contentPreview(int)
+     */
+    @Nullable
+    String responseContentPreview();
+
+    /**
      * Returns the string representation of the {@link Request}, with no sanitization of headers or content.
      */
     String toStringRequestOnly();
@@ -446,8 +535,8 @@ public interface RequestLog {
      * @param contentSanitizer a {@link Function} for sanitizing request content for logging. The result of the
      *     {@link Function} is what is actually logged as content.
      */
-    String toStringRequestOnly(Function<HttpHeaders, HttpHeaders> headersSanitizer,
-                               Function<Object, Object> contentSanitizer);
+    String toStringRequestOnly(Function<? super HttpHeaders, ? extends HttpHeaders> headersSanitizer,
+                               Function<Object, ?> contentSanitizer);
 
     /**
      * Returns the string representation of the {@link Response}, with no sanitization of headers or content.
@@ -462,6 +551,6 @@ public interface RequestLog {
      * @param contentSanitizer a {@link Function} for sanitizing response content for logging. The result of the
      *     {@link Function} is what is actually logged as content.
      */
-    String toStringResponseOnly(Function<HttpHeaders, HttpHeaders> headersSanitizer,
-                                Function<Object, Object> contentSanitizer);
+    String toStringResponseOnly(Function<? super HttpHeaders, ? extends HttpHeaders> headersSanitizer,
+                                Function<Object, ?> contentSanitizer);
 }

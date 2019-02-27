@@ -26,8 +26,8 @@ import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
-import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.common.util.SafeCloseable;
+import com.linecorp.armeria.server.DefaultServiceRequestContext;
 
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.EventLoop;
@@ -40,9 +40,6 @@ import io.netty.util.concurrent.Promise;
  * A skeletal {@link RequestContext} implementation.
  */
 public abstract class AbstractRequestContext implements RequestContext {
-
-    private static final CancellationException CANCELLATION_EXCEPTION =
-            Exceptions.clearTrace(new CancellationException());
 
     private boolean timedOut;
 
@@ -129,7 +126,7 @@ public abstract class AbstractRequestContext implements RequestContext {
     @Override
     public final <T> CompletionStage<T> makeContextAware(CompletionStage<T> stage) {
         final CompletableFuture<T> future = new RequestContextAwareCompletableFuture<>(this);
-        stage.whenComplete((result, cause) -> {
+        stage.handle((result, cause) -> {
             try (SafeCloseable ignored = pushIfAbsent()) {
                 if (cause != null) {
                     future.completeExceptionally(cause);
@@ -137,6 +134,7 @@ public abstract class AbstractRequestContext implements RequestContext {
                     future.complete(result);
                 }
             }
+            return null;
         });
         return future;
     }
@@ -154,7 +152,10 @@ public abstract class AbstractRequestContext implements RequestContext {
     /**
      * Marks this {@link RequestContext} as having been timed out. Any callbacks created with
      * {@code makeContextAware} that are run after this will be failed with {@link CancellationException}.
+     *
+     * @deprecated Use {@link DefaultServiceRequestContext#setTimedOut()}.
      */
+    @Deprecated
     public void setTimedOut() {
         timedOut = true;
     }

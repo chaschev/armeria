@@ -16,8 +16,8 @@
 
 package com.linecorp.armeria.client.tracing;
 
-import static com.linecorp.armeria.common.SessionProtocol.H2C;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -34,9 +34,8 @@ import org.junit.Test;
 import com.google.common.collect.ImmutableMap;
 
 import com.linecorp.armeria.client.Client;
-import com.linecorp.armeria.client.ClientOptions;
 import com.linecorp.armeria.client.ClientRequestContext;
-import com.linecorp.armeria.client.DefaultClientRequestContext;
+import com.linecorp.armeria.client.ClientRequestContextBuilder;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
@@ -45,14 +44,12 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
-import com.linecorp.armeria.common.metric.NoopMeterRegistry;
 import com.linecorp.armeria.common.tracing.HelloService;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.common.tracing.SpanCollectingReporter;
 
 import brave.Tracing;
 import brave.sampler.Sampler;
-import io.netty.channel.Channel;
-import io.netty.channel.DefaultEventLoop;
 import zipkin2.Span;
 import zipkin2.Span.Kind;
 
@@ -65,6 +62,21 @@ public class HttpTracingClientTest {
     @After
     public void tearDown() {
         Tracing.current().close();
+    }
+
+    @Test
+    public void newDecorator_shouldFailFastWhenRequestContextCurrentTraceContextNotConfigured() {
+        assertThatThrownBy(() -> HttpTracingClient.newDecorator(Tracing.newBuilder().build()))
+                .isInstanceOf(IllegalStateException.class).hasMessage(
+                "Tracing.currentTraceContext is not a RequestContextCurrentTraceContext scope. " +
+                "Please call Tracing.Builder.currentTraceContext(RequestContextCurrentTraceContext.INSTANCE)."
+        );
+    }
+
+    @Test
+    public void newDecorator_shouldWorkWhenRequestContextCurrentTraceContextConfigured() {
+        HttpTracingClient.newDecorator(
+                Tracing.newBuilder().currentTraceContext(RequestContextCurrentTraceContext.DEFAULT).build());
     }
 
     @Test(timeout = 20000)
@@ -88,8 +100,8 @@ public class HttpTracingClientTest {
         // only one span should be submitted
         assertThat(reporter.spans().poll(1, TimeUnit.SECONDS)).isNull();
 
-        // check # of annotations (zipkin2 format does not use them by default)
-        assertThat(span.annotations()).isEmpty();
+        // check # of annotations (we add wire annotations)
+        assertThat(span.annotations()).hasSize(2);
 
         // check tags
         assertThat(span.tags()).containsAllEntriesOf(ImmutableMap.of(
@@ -157,12 +169,12 @@ public class HttpTracingClientTest {
         final RpcRequest rpcReq = RpcRequest.of(HelloService.Iface.class, "hello", "Armeria");
         final HttpResponse res = HttpResponse.of(HttpStatus.OK);
         final RpcResponse rpcRes = RpcResponse.of("Hello, Armeria!");
-        final ClientRequestContext ctx = new DefaultClientRequestContext(
-                new DefaultEventLoop(), NoopMeterRegistry.get(), H2C, Endpoint.of("localhost", 8080),
-                HttpMethod.POST, "/hello/armeria", null, null, ClientOptions.DEFAULT, req);
+        final ClientRequestContext ctx =
+                ClientRequestContextBuilder.of(req)
+                                           .endpoint(Endpoint.of("localhost", 8080))
+                                           .build();
 
-        ctx.logBuilder().startRequest(mock(Channel.class), H2C);
-        ctx.logBuilder().requestHeaders(req.headers());
+        ctx.logBuilder().requestFirstBytesTransferred();
         ctx.logBuilder().requestContent(rpcReq, req);
         ctx.logBuilder().endRequest();
 
@@ -180,6 +192,7 @@ public class HttpTracingClientTest {
         verify(delegate, times(1)).execute(ctx, req);
 
         ctx.logBuilder().responseHeaders(HttpHeaders.of(HttpStatus.OK));
+        ctx.logBuilder().responseFirstBytesTransferred();
         ctx.logBuilder().responseContent(rpcRes, res);
         ctx.logBuilder().endResponse();
     }

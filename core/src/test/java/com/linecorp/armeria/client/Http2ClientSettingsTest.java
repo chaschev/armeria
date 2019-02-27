@@ -30,6 +30,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.ClassRule;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.DisableOnDebug;
@@ -39,41 +40,41 @@ import org.junit.rules.Timeout;
 import com.google.common.io.ByteStreams;
 
 import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.testing.common.EventLoopRule;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.DefaultEventLoop;
-import io.netty.channel.EventLoop;
 import io.netty.handler.codec.http2.DefaultHttp2FrameReader;
+import io.netty.handler.codec.http2.Http2CodecUtil;
 import io.netty.handler.codec.http2.Http2Error;
 import io.netty.handler.codec.http2.Http2EventAdapter;
 import io.netty.handler.codec.http2.Http2Exception;
 
 public class Http2ClientSettingsTest {
 
-    private static final EventLoop EVENT_LOOP = new DefaultEventLoop();
-
     private static final byte[] EMPTY_DATA = new byte[DEFAULT_MAX_FRAME_SIZE];
+
+    @ClassRule
+    public static final EventLoopRule eventLoop = new EventLoopRule();
 
     @Rule
     public TestRule globalTimeout = new DisableOnDebug(new Timeout(10, TimeUnit.SECONDS));
 
     @Test
     public void initialConnectionAndStreamWindowSize() throws Exception {
+        try (ServerSocket ss = new ServerSocket(0);
+             ClientFactory clientFactory = new ClientFactoryBuilder()
+                     .useHttp2Preface(true)
+                     // Client sends a WINDOW_UPDATE frame for connection when it receives 64 * 1024 bytes.
+                     .http2InitialConnectionWindowSize(128 * 1024)
+                     // Client sends a WINDOW_UPDATE frame for stream when it receives 48 * 1024 bytes.
+                     .http2InitialStreamWindowSize(96 * 1024)
+                     .build()) {
 
-        try (ServerSocket ss = new ServerSocket(0)) {
             final int port = ss.getLocalPort();
 
-            final ClientFactory clientFactory = new ClientFactoryBuilder()
-                    .useHttp2Preface(true)
-                    // Client sends a WINDOW_UPDATE frame for connection when it receives 64 * 1024 bytes.
-                    .initialHttp2ConnectionWindowSize(128 * 1024)
-                    // Client sends a WINDOW_UPDATE frame for stream when it receives 48 * 1024 bytes.
-                    .initialHttp2StreamWindowSize(96 * 1024)
-                    .build();
-
-            final HttpClient client = HttpClient.of(clientFactory, "h2c://localhost:" + port);
+            final HttpClient client = HttpClient.of(clientFactory, "h2c://127.0.0.1:" + port);
             final CompletableFuture<AggregatedHttpMessage> future = client.get("/").aggregate();
 
             try (Socket s = ss.accept()) {
@@ -139,15 +140,16 @@ public class Http2ClientSettingsTest {
 
     @Test
     public void maxFrameSize() throws Exception {
+        try (ServerSocket ss = new ServerSocket(0);
+             ClientFactory clientFactory = new ClientFactoryBuilder()
+                     .useHttp2Preface(true)
+                     // Set the window size to the HTTP/2 default values to simplify the traffic.
+                     .http2InitialConnectionWindowSize(Http2CodecUtil.DEFAULT_WINDOW_SIZE)
+                     .http2InitialStreamWindowSize(Http2CodecUtil.DEFAULT_WINDOW_SIZE)
+                     .http2MaxFrameSize(DEFAULT_MAX_FRAME_SIZE * 2) // == 16384 * 2
+                     .build()) {
 
-        try (ServerSocket ss = new ServerSocket(0)) {
             final int port = ss.getLocalPort();
-
-            final ClientFactory clientFactory = new ClientFactoryBuilder()
-                    .useHttp2Preface(true)
-                    .http2MaxFrameSize(DEFAULT_MAX_FRAME_SIZE * 2) // == 16384 * 2
-                    .build();
-
             final HttpClient client = HttpClient.of(clientFactory, "http://127.0.0.1:" + port);
             client.get("/").aggregate();
 
@@ -201,6 +203,9 @@ public class Http2ClientSettingsTest {
                 });
                 latch.await();
                 buffer.release();
+
+                // Client should disconnect after receiving a GOAWAY frame.
+                assertThat(in.read()).isEqualTo(-1);
             }
         }
     }
@@ -212,11 +217,11 @@ public class Http2ClientSettingsTest {
     }
 
     private static void assertSettingsFrameOfWindowSize(InputStream in) throws IOException {
-        final byte[] settingsFrameWithInitialStreamWindowSize = readBytes(in, 15);
-
+        final byte[] settingsFrameWithInitialStreamWindowSize = readBytes(in, 21);
         final byte[] expected = {
-                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x04, 0x00, 0x01, (byte) 0x80, 0x00
+                0x00, 0x00, 0x0C, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x04, 0x00, 0x01, (byte) 0x80, 0x00, // INITIAL_WINDOW_SIZE = 32768
+                0x00, 0x06, 0x00, 0x00, 0x20, 0x00         // MAX_HEADER_LIST_SIZE = 8192
         };
 
         // client sent initial stream window size of 0x18000 which is 96 * 1024.
@@ -278,7 +283,7 @@ public class Http2ClientSettingsTest {
     }
 
     private static int checkReadableForShortPeriod(InputStream in) throws Exception {
-        final Future<Integer> future = EVENT_LOOP.schedule(in::available, 500, TimeUnit.MILLISECONDS);
+        final Future<Integer> future = eventLoop.get().schedule(in::available, 500, TimeUnit.MILLISECONDS);
         return future.get();
     }
 
@@ -307,11 +312,12 @@ public class Http2ClientSettingsTest {
     }
 
     private static void assertSettingsFrameOfMaxFrameSize(InputStream in) throws IOException {
-        final byte[] settingsFrameWithMaxFrameSize = readBytes(in, 15);
-
+        final byte[] settingsFrameWithMaxFrameSize = readBytes(in, 21);
         final byte[] expected = {
-                0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x05, 0x00, 0x00, (byte) 0x80, 0x00
+                0x00, 0x00, 0x0C, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00,
+                // Note that there is no INITIAL_WINDOW_SIZE here because we specified the default (65535).
+                0x00, 0x05, 0x00, 0x00, (byte) 0x80, 0x00, // MAX_FRAME_SIZE = 32768
+                0x00, 0x06, 0x00, 0x00, (byte) 0x20, 0x00  // MAX_HEADER_LIST_SIZE = 8192
         };
 
         // client sent a SETTINGS_MAX_FRAME_SIZE of 0x8000.

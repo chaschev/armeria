@@ -15,11 +15,17 @@
  */
 package com.linecorp.armeria.server.annotation;
 
+import static com.linecorp.armeria.internal.ResponseConversionUtil.streamingFrom;
+
+import java.util.stream.Stream;
+
 import javax.annotation.Nullable;
 
+import org.reactivestreams.Publisher;
+
 import com.linecorp.armeria.common.HttpData;
+import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpResponse;
-import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.server.ServiceRequestContext;
 
@@ -31,31 +37,57 @@ public class ByteArrayResponseConverterFunction implements ResponseConverterFunc
 
     @Override
     public HttpResponse convertResponse(ServiceRequestContext ctx,
-                                        @Nullable Object result) throws Exception {
-        if (result instanceof HttpData) {
-            return HttpResponse.of(HttpStatus.OK, mediaType(ctx.negotiatedResponseMediaType()),
-                                   ((HttpData) result).array());
+                                        HttpHeaders headers,
+                                        @Nullable Object result,
+                                        HttpHeaders trailingHeaders) throws Exception {
+        final MediaType contentType = headers.contentType();
+        if (contentType != null) {
+            // @Produces("application/binary") or @ProducesBinary
+            // @Produces("application/octet-stream") or @ProducesOctetStream
+            if (contentType.is(MediaType.APPLICATION_BINARY) ||
+                contentType.is(MediaType.OCTET_STREAM)) {
+                // We assume that the publisher and stream produces HttpData or byte[].
+                // An IllegalStateException will be raised for other types due to conversion failure.
+                if (result instanceof Publisher) {
+                    return streamingFrom((Publisher<?>) result, headers, trailingHeaders,
+                                         ByteArrayResponseConverterFunction::toHttpData);
+                }
+                if (result instanceof Stream) {
+                    return streamingFrom((Stream<?>) result, headers, trailingHeaders,
+                                         ByteArrayResponseConverterFunction::toHttpData,
+                                         ctx.blockingTaskExecutor());
+                }
+                if (result instanceof HttpData) {
+                    return HttpResponse.of(headers, (HttpData) result, trailingHeaders);
+                }
+                if (result instanceof byte[]) {
+                    return HttpResponse.of(headers, HttpData.of((byte[]) result), trailingHeaders);
+                }
+
+                return ResponseConverterFunction.fallthrough();
+            }
+        } else if (result instanceof HttpData) {
+            return HttpResponse.of(headers.toMutable().contentType(MediaType.OCTET_STREAM),
+                                   (HttpData) result, trailingHeaders);
+        } else if (result instanceof byte[]) {
+            return HttpResponse.of(headers.toMutable().contentType(MediaType.OCTET_STREAM),
+                                   HttpData.of((byte[]) result), trailingHeaders);
         }
-        if (result instanceof byte[]) {
-            return HttpResponse.of(HttpStatus.OK, mediaType(ctx.negotiatedResponseMediaType()),
-                                   (byte[]) result);
-        }
+
         return ResponseConverterFunction.fallthrough();
     }
 
-    private static MediaType mediaType(@Nullable MediaType mediaType) {
-        if (mediaType == null) {
-            return MediaType.APPLICATION_BINARY;
+    private static HttpData toHttpData(@Nullable Object value) {
+        if (value instanceof HttpData) {
+            return (HttpData) value;
         }
-
-        // A user expects 'binary'.
-        if (mediaType.is(MediaType.APPLICATION_BINARY) ||
-            mediaType.is(MediaType.OCTET_STREAM)) {
-            // @Produces("application/binary") or @ProducesBinary
-            // @Produces("application/octet-stream") or @ProducesOctetStream
-            return mediaType;
+        if (value instanceof byte[]) {
+            return HttpData.of((byte[]) value);
         }
-
-        return ResponseConverterFunction.fallthrough();
+        if (value == null) {
+            return HttpData.EMPTY_DATA;
+        }
+        throw new IllegalStateException("Failed to convert an object to an HttpData: " +
+                                        value.getClass().getName());
     }
 }

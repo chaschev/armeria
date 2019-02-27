@@ -25,6 +25,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.net.InetAddress;
+import java.nio.charset.Charset;
 import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,8 +45,12 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.MediaTypeSet;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.logging.ContentPreviewer;
+import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
+import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.annotation.AnnotatedHttpServiceElement;
+import com.linecorp.armeria.internal.annotation.AnnotatedHttpServiceFactory;
 import com.linecorp.armeria.internal.crypto.BouncyCastleKeyFactoryProvider;
-import com.linecorp.armeria.server.AnnotatedHttpServiceFactory.AnnotatedHttpServiceElement;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.RequestConverterFunction;
 import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
@@ -92,15 +97,15 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
             process = Runtime.getRuntime().exec("hostname");
             final String line = new BufferedReader(new InputStreamReader(process.getInputStream())).readLine();
             if (line == null) {
-                logger.warn("The 'hostname' command returned nothing; " +
-                            "using InetAddress.getLocalHost() instead");
+                logger.debug("The 'hostname' command returned nothing; " +
+                             "using InetAddress.getLocalHost() instead");
             } else {
                 hostname = normalizeDefaultHostname(line.trim());
-                logger.info("Hostname: {} (via 'hostname' command)", hostname);
+                logger.info("Hostname: {} (from 'hostname' command)", hostname);
             }
         } catch (Exception e) {
-            logger.warn("Failed to get the hostname using the 'hostname' command; " +
-                        "using InetAddress.getLocalHost() instead", e);
+            logger.debug("Failed to get the hostname using the 'hostname' command; " +
+                         "using InetAddress.getLocalHost() instead", e);
         } finally {
             if (process != null) {
                 process.destroy();
@@ -110,7 +115,7 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
         if (hostname == null) {
             try {
                 hostname = normalizeDefaultHostname(InetAddress.getLocalHost().getHostName());
-                logger.info("Hostname: {} (via InetAddress.getLocalHost())", hostname);
+                logger.info("Hostname: {} (from InetAddress.getLocalHost())", hostname);
             } catch (Exception e) {
                 hostname = "localhost";
                 logger.warn("Failed to get the hostname using InetAddress.getLocalHost(); " +
@@ -128,6 +133,13 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     private SslContext sslContext;
     @Nullable
     private Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator;
+    @Nullable
+    private Function<VirtualHost, Logger> accessLoggerMapper;
+
+    @Nullable
+    private ContentPreviewerFactory requestContentPreviewerFactory;
+    @Nullable
+    private ContentPreviewerFactory responseContentPreviewerFactory;
 
     /**
      * Creates a new {@link VirtualHostBuilder} whose hostname pattern is {@code "*"} (match-all).
@@ -389,8 +401,8 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
                                       ? extends Service<HttpRequest, HttpResponse>> decorator,
                               Object... exceptionHandlersAndConverters) {
         return annotatedService("/", service, decorator,
-                                requireNonNull(exceptionHandlersAndConverters,
-                                               "exceptionHandlersAndConverters"));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -438,10 +450,23 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
      *                                       {@link ResponseConverterFunction}
      */
     public B annotatedService(String pathPrefix, Object service,
+                              Iterable<?> exceptionHandlersAndConverters) {
+        return annotatedService(pathPrefix, service, Function.identity(),
+                                requireNonNull(exceptionHandlersAndConverters,
+                                               "exceptionHandlersAndConverters"));
+    }
+
+    /**
+     * Binds the specified annotated service object under the specified path prefix.
+     *
+     * @param exceptionHandlersAndConverters an iterable object of {@link ExceptionHandlerFunction},
+     *                                       {@link RequestConverterFunction} and/or
+     *                                       {@link ResponseConverterFunction}
+     */
+    public B annotatedService(String pathPrefix, Object service,
                               Function<Service<HttpRequest, HttpResponse>,
                                       ? extends Service<HttpRequest, HttpResponse>> decorator,
                               Iterable<?> exceptionHandlersAndConverters) {
-
         requireNonNull(pathPrefix, "pathPrefix");
         requireNonNull(service, "service");
         requireNonNull(decorator, "decorator");
@@ -449,7 +474,20 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
 
         final List<AnnotatedHttpServiceElement> elements =
                 AnnotatedHttpServiceFactory.find(pathPrefix, service, exceptionHandlersAndConverters);
-        elements.forEach(e -> service(e.pathMapping(), decorator.apply(e.decorator().apply(e.service()))));
+        elements.forEach(e -> {
+            Service<HttpRequest, HttpResponse> s = e.service();
+            // Apply decorators which are specified in the service class.
+            s = e.decorator().apply(s);
+            // Apply decorators which are passed via annotatedService() methods.
+            s = decorator.apply(s);
+
+            // If there is a decorator, we should add one more decorator which handles an exception
+            // raised from decorators.
+            if (s != e.service()) {
+                s = e.service().exceptionHandlingDecorator().apply(s);
+            }
+            service(e.pathMapping(), s);
+        });
         return self();
     }
 
@@ -490,18 +528,103 @@ abstract class AbstractVirtualHostBuilder<B extends AbstractVirtualHostBuilder> 
     protected VirtualHost build() {
         final List<MediaType> producibleTypes = new ArrayList<>();
 
-        services.forEach(e -> {
-            final PathMapping mapping = e.pathMapping();
-            if (mapping instanceof HttpHeaderPathMapping) {
-                // Collect producible media types over this virtual host.
-                producibleTypes.addAll(((HttpHeaderPathMapping) mapping).produceTypes());
-            }
-        });
+        // Collect producible media types over this virtual host.
+        services.forEach(s -> producibleTypes.addAll(s.pathMapping().produceTypes()));
 
         final VirtualHost virtualHost =
                 new VirtualHost(defaultHostname, hostnamePattern, sslContext, services,
-                                new MediaTypeSet(producibleTypes));
+                                new MediaTypeSet(producibleTypes), RejectedPathMappingHandler.DISABLED,
+                                accessLoggerMapper, requestContentPreviewerFactory,
+                                responseContentPreviewerFactory);
         return decorator != null ? virtualHost.decorate(decorator) : virtualHost;
+    }
+
+    /**
+     * Sets the access logger mapper of this {@link VirtualHost}.
+     * When {@link #build()} is called, this {@link VirtualHost} gets {@link Logger}
+     * via the {@code mapper} for writing access logs.
+     */
+    public B accessLogger(Function<VirtualHost, Logger> mapper) {
+        accessLoggerMapper = requireNonNull(mapper, "mapper");
+        return self();
+    }
+
+    /**
+     * Sets the {@link Logger} of this {@link VirtualHost}, which is used for writing access logs.
+     */
+    public B accessLogger(Logger logger) {
+        requireNonNull(logger, "logger");
+        return accessLogger(host -> logger);
+    }
+
+    /**
+     * Sets the {@link Logger} named {@code loggerName} of this {@link VirtualHost},
+     * which is used for writing access logs.
+     */
+    public B accessLogger(String loggerName) {
+        requireNonNull(loggerName, "loggerName");
+        return accessLogger(host -> LoggerFactory.getLogger(loggerName));
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a request of this {@link VirtualHost}.
+     */
+    public B requestContentPreviewerFactory(ContentPreviewerFactory factory) {
+        requestContentPreviewerFactory = requireNonNull(factory, "factory");
+        return self();
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a response of this {@link VirtualHost}.
+     */
+    public B responseContentPreviewerFactory(ContentPreviewerFactory factory) {
+        responseContentPreviewerFactory = requireNonNull(factory, "factory");
+        return self();
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a request and a response of this {@link VirtualHost}.
+     */
+    public B contentPreviewerFactory(ContentPreviewerFactory factory) {
+        requestContentPreviewerFactory(factory);
+        responseContentPreviewerFactory(factory);
+        return self();
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} creating a {@link ContentPreviewer} which produces the preview
+     * with the maxmium {@code length} limit for a request and a response of this {@link VirtualHost}.
+     * The previewer is enabled only if the content type of a request/response meets
+     * any of the following cases.
+     * <ul>
+     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
+     *     <li>when its charset has been specified</li>
+     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
+     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
+     * </ul>
+     * @param length the maximum length of the preview.
+     * @param defaultCharset the default charset for a request/response with unspecified charset in
+     *                       {@code "content-type"} header.
+     */
+    public B contentPreview(int length, Charset defaultCharset) {
+        return contentPreviewerFactory(ContentPreviewerFactory.ofText(length, defaultCharset));
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} creating a {@link ContentPreviewer} which produces the preview
+     * with the maxmium {@code length} limit for a request and a response of this {@link VirtualHost}.
+     * The previewer is enabled only if the content type of a request/response meets
+     * any of the following cases.
+     * <ul>
+     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
+     *     <li>when its charset has been specified</li>
+     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
+     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
+     * </ul>
+     * @param length the maximum length of the preview.
+     */
+    public B contentPreview(int length) {
+        return contentPreview(length, ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET);
     }
 
     @Override

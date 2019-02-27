@@ -19,6 +19,7 @@ package com.linecorp.armeria.server;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,13 +28,15 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
-import java.util.function.Consumer;
+import java.util.function.Predicate;
 
 import javax.annotation.Nullable;
 
+import com.google.common.collect.ImmutableList;
+
 import com.linecorp.armeria.common.Request;
-import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.internal.ConnectionLimitingHandler;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.channel.ChannelOption;
@@ -61,13 +64,20 @@ public final class ServerConfig {
 
     private final EventLoopGroup workerGroup;
     private final boolean shutdownWorkerGroupOnStop;
+    private final Executor startStopExecutor;
     private final int maxNumConnections;
     private final long defaultRequestTimeoutMillis;
     private final long idleTimeoutMillis;
     private final long defaultMaxRequestLength;
-    private final int defaultMaxHttp1InitialLineLength;
-    private final int defaultMaxHttp1HeaderSize;
-    private final int defaultMaxHttp1ChunkSize;
+    private final boolean verboseResponses;
+    private final int http2InitialConnectionWindowSize;
+    private final int http2InitialStreamWindowSize;
+    private final long http2MaxStreamsPerConnection;
+    private final int http2MaxFrameSize;
+    private final long http2MaxHeaderListSize;
+    private final int http1MaxInitialLineLength;
+    private final int http1MaxHeaderSize;
+    private final int http1MaxChunkSize;
 
     private final Duration gracefulShutdownQuietPeriod;
     private final Duration gracefulShutdownTimeout;
@@ -78,12 +88,17 @@ public final class ServerConfig {
 
     private final String serviceLoggerPrefix;
 
-    private final Consumer<RequestLog> accessLogWriter;
+    private final AccessLogWriter accessLogWriter;
+    private final boolean shutdownAccessLogWriterOnStop;
 
     private final int proxyProtocolMaxTlvSize;
 
     private final Map<ChannelOption<?>, ?> channelOptions;
     private final Map<ChannelOption<?>, ?> childChannelOptions;
+
+    private final List<ClientAddressSource> clientAddressSources;
+    private final Predicate<InetAddress> clientAddressTrustedProxyFilter;
+    private final Predicate<InetAddress> clientAddressFilter;
 
     @Nullable
     private String strVal;
@@ -91,15 +106,20 @@ public final class ServerConfig {
     ServerConfig(
             Iterable<ServerPort> ports,
             VirtualHost defaultVirtualHost, Iterable<VirtualHost> virtualHosts,
-            EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop,
+            EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop, Executor startStopExecutor,
             int maxNumConnections, long idleTimeoutMillis,
-            long defaultRequestTimeoutMillis, long defaultMaxRequestLength,
-            int defaultMaxHttp1InitialLineLength, int defaultMaxHttp1HeaderSize, int defaultMaxHttp1ChunkSize,
+            long defaultRequestTimeoutMillis, long defaultMaxRequestLength, boolean verboseResponses,
+            int http2InitialConnectionWindowSize, int http2InitialStreamWindowSize,
+            long http2MaxStreamsPerConnection, int http2MaxFrameSize, long http2MaxHeaderListSize,
+            int http1MaxInitialLineLength, int http1MaxHeaderSize, int http1MaxChunkSize,
             Duration gracefulShutdownQuietPeriod, Duration gracefulShutdownTimeout,
             Executor blockingTaskExecutor, MeterRegistry meterRegistry, String serviceLoggerPrefix,
-            Consumer<RequestLog> accessLogWriter, int proxyProtocolMaxTlvSize,
+            AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop, int proxyProtocolMaxTlvSize,
             Map<ChannelOption<?>, Object> channelOptions,
-            Map<ChannelOption<?>, Object> childChannelOptions) {
+            Map<ChannelOption<?>, Object> childChannelOptions,
+            List<ClientAddressSource> clientAddressSources,
+            Predicate<InetAddress> clientAddressTrustedProxyFilter,
+            Predicate<InetAddress> clientAddressFilter) {
 
         requireNonNull(ports, "ports");
         requireNonNull(defaultVirtualHost, "defaultVirtualHost");
@@ -108,16 +128,23 @@ public final class ServerConfig {
         // Set the primitive properties.
         this.workerGroup = requireNonNull(workerGroup, "workerGroup");
         this.shutdownWorkerGroupOnStop = shutdownWorkerGroupOnStop;
+        this.startStopExecutor = requireNonNull(startStopExecutor, "startStopExecutor");
         this.maxNumConnections = validateMaxNumConnections(maxNumConnections);
         this.idleTimeoutMillis = validateIdleTimeoutMillis(idleTimeoutMillis);
         this.defaultRequestTimeoutMillis = validateDefaultRequestTimeoutMillis(defaultRequestTimeoutMillis);
         this.defaultMaxRequestLength = validateDefaultMaxRequestLength(defaultMaxRequestLength);
-        this.defaultMaxHttp1InitialLineLength = validateNonNegative(
-                defaultMaxHttp1InitialLineLength, "defaultMaxHttp1InitialLineLength");
-        this.defaultMaxHttp1HeaderSize = validateNonNegative(
-                defaultMaxHttp1HeaderSize, "defaultMaxHttp1HeaderSize");
-        this.defaultMaxHttp1ChunkSize = validateNonNegative(
-                defaultMaxHttp1ChunkSize, "defaultMaxHttp1ChunkSize");
+        this.verboseResponses = verboseResponses;
+        this.http2InitialConnectionWindowSize = http2InitialConnectionWindowSize;
+        this.http2InitialStreamWindowSize = http2InitialStreamWindowSize;
+        this.http2MaxStreamsPerConnection = http2MaxStreamsPerConnection;
+        this.http2MaxFrameSize = http2MaxFrameSize;
+        this.http2MaxHeaderListSize = http2MaxHeaderListSize;
+        this.http1MaxInitialLineLength = validateNonNegative(
+                http1MaxInitialLineLength, "http1MaxInitialLineLength");
+        this.http1MaxHeaderSize = validateNonNegative(
+                http1MaxHeaderSize, "http1MaxHeaderSize");
+        this.http1MaxChunkSize = validateNonNegative(
+                http1MaxChunkSize, "http1MaxChunkSize");
         this.gracefulShutdownQuietPeriod = validateNonNegative(requireNonNull(
                 gracefulShutdownQuietPeriod), "gracefulShutdownQuietPeriod");
         this.gracefulShutdownTimeout = validateNonNegative(requireNonNull(
@@ -135,10 +162,16 @@ public final class ServerConfig {
         this.meterRegistry = requireNonNull(meterRegistry, "meterRegistry");
         this.serviceLoggerPrefix = ServiceConfig.validateLoggerName(serviceLoggerPrefix, "serviceLoggerPrefix");
         this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
+        this.shutdownAccessLogWriterOnStop = shutdownAccessLogWriterOnStop;
         this.channelOptions = Collections.unmodifiableMap(
                 new Object2ObjectArrayMap<>(requireNonNull(channelOptions, "channelOptions")));
         this.childChannelOptions = Collections.unmodifiableMap(
                 new Object2ObjectArrayMap<>(requireNonNull(childChannelOptions, "childChannelOptions")));
+        this.clientAddressSources = ImmutableList.copyOf(
+                requireNonNull(clientAddressSources, "clientAddressSources"));
+        this.clientAddressTrustedProxyFilter =
+                requireNonNull(clientAddressTrustedProxyFilter, "clientAddressTrustedProxyFilter");
+        this.clientAddressFilter = requireNonNull(clientAddressFilter, "clientAddressFilter");
 
         // Set localAddresses.
         final List<ServerPort> portsCopy = new ArrayList<>();
@@ -352,6 +385,16 @@ public final class ServerConfig {
     }
 
     /**
+     * Returns the {@link Executor} which will invoke the callbacks of {@link Server#start()},
+     * {@link Server#stop()} and {@link ServerListener}.
+     *
+     * <p>Note: Kept non-public since it doesn't seem useful for users.</p>
+     */
+    Executor startStopExecutor() {
+        return startStopExecutor;
+    }
+
+    /**
      * Returns the {@link ChannelOption}s and their values of {@link Server}'s server sockets.
      */
     public Map<ChannelOption<?>, ?> channelOptions() {
@@ -395,26 +438,70 @@ public final class ServerConfig {
     }
 
     /**
-     * Returns the default maximum length of an HTTP/1 response initial line.
+     * Returns whether the verbose response mode is enabled. When enabled, the server responses will contain
+     * the exception type and its full stack trace, which may be useful for debugging while potentially
+     * insecure. When disabled, the server responses will not expose such server-side details to the client.
      */
-    public int defaultMaxHttp1InitialLineLength() {
-        return defaultMaxHttp1InitialLineLength;
+    public boolean verboseResponses() {
+        return verboseResponses;
     }
 
     /**
-     * Returns the default maximum length of all headers in an HTTP/1 response.
+     * Returns the maximum length of an HTTP/1 response initial line.
      */
-    public int defaultMaxHttp1HeaderSize() {
-        return defaultMaxHttp1HeaderSize;
+    public int http1MaxInitialLineLength() {
+        return http1MaxInitialLineLength;
     }
 
     /**
-     * Returns the default maximum length of each chunk in an HTTP/1 response content.
+     * Returns the maximum length of all headers in an HTTP/1 response.
+     */
+    public int http1MaxHeaderSize() {
+        return http1MaxHeaderSize;
+    }
+
+    /**
+     * Returns the maximum length of each chunk in an HTTP/1 response content.
      * The content or a chunk longer than this value will be split into smaller chunks
      * so that their lengths never exceed it.
      */
-    public int defaultMaxHttp1ChunkSize() {
-        return defaultMaxHttp1ChunkSize;
+    public int http1MaxChunkSize() {
+        return http1MaxChunkSize;
+    }
+
+    /**
+     * Returns the initial connection-level HTTP/2 flow control window size.
+     */
+    public int http2InitialConnectionWindowSize() {
+        return http2InitialConnectionWindowSize;
+    }
+
+    /**
+     * Returns the initial stream-level HTTP/2 flow control window size.
+     */
+    public int http2InitialStreamWindowSize() {
+        return http2InitialStreamWindowSize;
+    }
+
+    /**
+     * Returns the maximum number of concurrent streams per HTTP/2 connection.
+     */
+    public long http2MaxStreamsPerConnection() {
+        return http2MaxStreamsPerConnection;
+    }
+
+    /**
+     * Returns the maximum size of HTTP/2 frames that can be received.
+     */
+    public int http2MaxFrameSize() {
+        return http2MaxFrameSize;
+    }
+
+    /**
+     * Returns the maximum size of headers that can be received.
+     */
+    public long http2MaxHeaderListSize() {
+        return http2MaxHeaderListSize;
     }
 
     /**
@@ -460,8 +547,15 @@ public final class ServerConfig {
     /**
      * Returns an access log writer.
      */
-    public Consumer<RequestLog> accessLogWriter() {
+    public AccessLogWriter accessLogWriter() {
         return accessLogWriter;
+    }
+
+    /**
+     * Returns whether the {@link AccessLogWriter} is shut down when the {@link Server} stops.
+     */
+    public boolean shutdownAccessLogWriterOnStop() {
+        return shutdownAccessLogWriterOnStop;
     }
 
     /**
@@ -472,6 +566,28 @@ public final class ServerConfig {
         return proxyProtocolMaxTlvSize;
     }
 
+    /**
+     * Returns a list of {@link ClientAddressSource}s which are used to determine where to look for
+     * the client address, in the order of preference.
+     */
+    public List<ClientAddressSource> clientAddressSources() {
+        return clientAddressSources;
+    }
+
+    /**
+     * Returns a filter which evaluates whether an {@link InetAddress} of a remote endpoint is trusted.
+     */
+    public Predicate<InetAddress> clientAddressTrustedProxyFilter() {
+        return clientAddressTrustedProxyFilter;
+    }
+
+    /**
+     * Returns a filter which evaluates whether an {@link InetAddress} can be used as a client address.
+     */
+    public Predicate<InetAddress> clientAddressFilter() {
+        return clientAddressFilter;
+    }
+
     @Override
     public String toString() {
         String strVal = this.strVal;
@@ -480,11 +596,15 @@ public final class ServerConfig {
                     getClass(), ports(), null, virtualHosts(),
                     workerGroup(), shutdownWorkerGroupOnStop(),
                     maxNumConnections(), idleTimeoutMillis(),
-                    defaultRequestTimeoutMillis(), defaultMaxRequestLength(),
-                    defaultMaxHttp1InitialLineLength(), defaultMaxHttp1HeaderSize(), defaultMaxHttp1ChunkSize(),
+                    defaultRequestTimeoutMillis(), defaultMaxRequestLength(), verboseResponses(),
+                    http2InitialConnectionWindowSize(), http2InitialStreamWindowSize(),
+                    http2MaxStreamsPerConnection(), http2MaxFrameSize(), http2MaxHeaderListSize(),
+                    http1MaxInitialLineLength(), http1MaxHeaderSize(), http1MaxChunkSize(),
                     proxyProtocolMaxTlvSize(), gracefulShutdownQuietPeriod(), gracefulShutdownTimeout(),
-                    blockingTaskExecutor(), meterRegistry(), serviceLoggerPrefix(), accessLogWriter(),
-                    channelOptions(), childChannelOptions()
+                    blockingTaskExecutor(), meterRegistry(), serviceLoggerPrefix(),
+                    accessLogWriter(), shutdownAccessLogWriterOnStop(),
+                    channelOptions(), childChannelOptions(),
+                    clientAddressSources(), clientAddressTrustedProxyFilter(), clientAddressFilter()
             );
         }
 
@@ -496,12 +616,17 @@ public final class ServerConfig {
             @Nullable VirtualHost defaultVirtualHost, List<VirtualHost> virtualHosts,
             EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnStop,
             int maxNumConnections, long idleTimeoutMillis, long defaultRequestTimeoutMillis,
-            long defaultMaxRequestLength, long defaultMaxHttp1InitialLineLength,
-            long defaultMaxHttp1HeaderSize, long defaultMaxHttp1ChunkSize, int proxyProtocolMaxTlvSize,
+            long defaultMaxRequestLength, boolean verboseResponses, int http2InitialConnectionWindowSize,
+            int http2InitialStreamWindowSize, long http2MaxStreamsPerConnection, int http2MaxFrameSize,
+            long http2MaxHeaderListSize, long http1MaxInitialLineLength, long http1MaxHeaderSize,
+            long http1MaxChunkSize, int proxyProtocolMaxTlvSize,
             Duration gracefulShutdownQuietPeriod, Duration gracefulShutdownTimeout,
             Executor blockingTaskExecutor, @Nullable MeterRegistry meterRegistry, String serviceLoggerPrefix,
-            Consumer<RequestLog> accessLogWriter, Map<ChannelOption<?>, ?> channelOptions,
-            Map<ChannelOption<?>, ?> childChannelOptions) {
+            AccessLogWriter accessLogWriter, boolean shutdownAccessLogWriterOnStop,
+            Map<ChannelOption<?>, ?> channelOptions, Map<ChannelOption<?>, ?> childChannelOptions,
+            List<ClientAddressSource> clientAddressSources,
+            Predicate<InetAddress> clientAddressTrustedProxyFilter,
+            Predicate<InetAddress> clientAddressFilter) {
 
         final StringBuilder buf = new StringBuilder();
         if (type != null) {
@@ -557,12 +682,24 @@ public final class ServerConfig {
         buf.append(defaultRequestTimeoutMillis);
         buf.append("ms, defaultMaxRequestLength: ");
         buf.append(defaultMaxRequestLength);
-        buf.append("B, defaultMaxHttp1InitialLineLength: ");
-        buf.append(defaultMaxHttp1InitialLineLength);
-        buf.append("B, defaultMaxHttp1HeaderSize: ");
-        buf.append(defaultMaxHttp1HeaderSize);
-        buf.append("B, defaultMaxHttp1ChunkSize: ");
-        buf.append(defaultMaxHttp1ChunkSize);
+        buf.append("B, verboseResponses: ");
+        buf.append(verboseResponses);
+        buf.append(", http2InitialConnectionWindowSize: ");
+        buf.append(http2InitialConnectionWindowSize);
+        buf.append("B, http2InitialStreamWindowSize: ");
+        buf.append(http2InitialStreamWindowSize);
+        buf.append("B, http2MaxStreamsPerConnection: ");
+        buf.append(http2MaxStreamsPerConnection);
+        buf.append(", http2MaxFrameSize: ");
+        buf.append(http2MaxFrameSize);
+        buf.append("B, http2MaxHeaderListSize: ");
+        buf.append(http2MaxHeaderListSize);
+        buf.append("B, http1MaxInitialLineLength: ");
+        buf.append(http1MaxInitialLineLength);
+        buf.append("B, http1MaxHeaderSize: ");
+        buf.append(http1MaxHeaderSize);
+        buf.append("B, http1MaxChunkSize: ");
+        buf.append(http1MaxChunkSize);
         buf.append("B, proxyProtocolMaxTlvSize: ");
         buf.append(proxyProtocolMaxTlvSize);
         buf.append("B, gracefulShutdownQuietPeriod: ");
@@ -579,11 +716,19 @@ public final class ServerConfig {
         buf.append(serviceLoggerPrefix);
         buf.append(", accessLogWriter: ");
         buf.append(accessLogWriter);
+        buf.append(", shutdownAccessLogWriterOnStop: ");
+        buf.append(shutdownAccessLogWriterOnStop);
         buf.append(')');
         buf.append(", channelOptions: ");
         buf.append(channelOptions);
         buf.append(", childChannelOptions: ");
         buf.append(childChannelOptions);
+        buf.append(", clientAddressSources: ");
+        buf.append(clientAddressSources);
+        buf.append(", clientAddressTrustedProxyFilter: ");
+        buf.append(clientAddressTrustedProxyFilter);
+        buf.append(", clientAddressFilter: ");
+        buf.append(clientAddressFilter);
 
         return buf.toString();
     }

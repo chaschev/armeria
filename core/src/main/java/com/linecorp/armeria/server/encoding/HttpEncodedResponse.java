@@ -45,7 +45,7 @@ class HttpEncodedResponse extends FilteredHttpResponse {
 
     private final HttpEncodingType encodingType;
     private final Predicate<MediaType> encodableContentTypePredicate;
-    private final int minBytesToForceChunkedAndEncoding;
+    private final long minBytesToForceChunkedAndEncoding;
 
     @Nullable
     private ByteArrayOutputStream encodedStream;
@@ -59,7 +59,7 @@ class HttpEncodedResponse extends FilteredHttpResponse {
             HttpResponse delegate,
             HttpEncodingType encodingType,
             Predicate<MediaType> encodableContentTypePredicate,
-            int minBytesToForceChunkedAndEncoding) {
+            long minBytesToForceChunkedAndEncoding) {
         super(delegate);
         this.encodingType = requireNonNull(encodingType, "encodingType");
         this.encodableContentTypePredicate = requireNonNull(encodableContentTypePredicate,
@@ -97,18 +97,19 @@ class HttpEncodedResponse extends FilteredHttpResponse {
             encodedStream = new ByteArrayOutputStream();
             encodingStream = HttpEncoders.getEncodingOutputStream(encodingType, encodedStream);
 
+            final HttpHeaders mutable = headers.toMutable();
             // Always use chunked encoding when compressing.
-            headers.remove(HttpHeaderNames.CONTENT_LENGTH);
+            mutable.remove(HttpHeaderNames.CONTENT_LENGTH);
             switch (encodingType) {
                 case GZIP:
-                    headers.set(HttpHeaderNames.CONTENT_ENCODING, "gzip");
+                    mutable.set(HttpHeaderNames.CONTENT_ENCODING, "gzip");
                     break;
                 case DEFLATE:
-                    headers.set(HttpHeaderNames.CONTENT_ENCODING, "deflate");
+                    mutable.set(HttpHeaderNames.CONTENT_ENCODING, "deflate");
                     break;
             }
-            headers.set(HttpHeaderNames.VARY, HttpHeaderNames.ACCEPT_ENCODING.toString());
-            return headers;
+            mutable.set(HttpHeaderNames.VARY, HttpHeaderNames.ACCEPT_ENCODING.toString());
+            return mutable;
         }
 
         if (encodingStream == null) {

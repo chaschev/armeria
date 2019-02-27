@@ -16,6 +16,7 @@
 package com.linecorp.armeria.client.retry;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static java.util.Objects.requireNonNull;
 
 import java.util.concurrent.TimeUnit;
@@ -27,13 +28,14 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.linecorp.armeria.client.Client;
+import com.linecorp.armeria.client.ClientFactory;
 import com.linecorp.armeria.client.ClientRequestContext;
-import com.linecorp.armeria.client.ClosedClientFactoryException;
 import com.linecorp.armeria.client.SimpleDecoratingClient;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.Response;
-import com.linecorp.armeria.common.util.SafeCloseable;
 
+import io.netty.util.AsciiString;
 import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.ScheduledFuture;
 
@@ -48,20 +50,52 @@ public abstract class RetryingClient<I extends Request, O extends Response>
 
     private static final Logger logger = LoggerFactory.getLogger(RetryingClient.class);
 
+    /**
+     * The header which indicates the retry count of a {@link Request}.
+     * The server might use this value to reject excessive retries, etc.
+     */
+    public static final AsciiString ARMERIA_RETRY_COUNT = HttpHeaderNames.of("armeria-retry-count");
+
     private static final AttributeKey<State> STATE =
             AttributeKey.valueOf(RetryingClient.class, "STATE");
 
-    private final RetryStrategy<I, O> retryStrategy;
+    @Nullable
+    private final RetryStrategy retryStrategy;
+
+    @Nullable
+    private final RetryStrategyWithContent<O> retryStrategyWithContent;
+
     private final int maxTotalAttempts;
     private final long responseTimeoutMillisForEachAttempt;
 
     /**
      * Creates a new instance that decorates the specified {@link Client}.
      */
-    protected RetryingClient(Client<I, O> delegate, RetryStrategy<I, O> retryStrategy,
+    protected RetryingClient(Client<I, O> delegate, RetryStrategy retryStrategy,
                              int maxTotalAttempts, long responseTimeoutMillisForEachAttempt) {
+        this(delegate, requireNonNull(retryStrategy, "retryStrategyWithoutContent"), null,
+             maxTotalAttempts, responseTimeoutMillisForEachAttempt);
+    }
+
+    /**
+     * Creates a new instance that decorates the specified {@link Client}.
+     */
+    protected RetryingClient(Client<I, O> delegate, RetryStrategyWithContent<O> retryStrategyWithContent,
+                             int maxTotalAttempts, long responseTimeoutMillisForEachAttempt) {
+        this(delegate, null, requireNonNull(retryStrategyWithContent, "retryStrategyWithContent"),
+             maxTotalAttempts, responseTimeoutMillisForEachAttempt);
+    }
+
+    /**
+     * Creates a new instance that decorates the specified {@link Client}.
+     */
+    private RetryingClient(Client<I, O> delegate, @Nullable RetryStrategy retryStrategy,
+                           @Nullable RetryStrategyWithContent<O> retryStrategyWithContent,
+                           int maxTotalAttempts, long responseTimeoutMillisForEachAttempt) {
         super(delegate);
-        this.retryStrategy = requireNonNull(retryStrategy, "retryStrategy");
+        this.retryStrategy = retryStrategy;
+        this.retryStrategyWithContent = retryStrategyWithContent;
+
         checkArgument(maxTotalAttempts > 0, "maxTotalAttempts: %s (expected: > 0)", maxTotalAttempts);
         this.maxTotalAttempts = maxTotalAttempts;
 
@@ -86,25 +120,30 @@ public abstract class RetryingClient<I extends Request, O extends Response>
     protected abstract O doExecute(ClientRequestContext ctx, I req) throws Exception;
 
     /**
-     * Executes the delegate with a new derived {@link ClientRequestContext}.
-     */
-    protected final O executeDelegate(ClientRequestContext ctx, I req) throws Exception {
-        final ClientRequestContext derivedContext = ctx.newDerivedContext(req);
-        ctx.logBuilder().addChild(derivedContext.log());
-        try (SafeCloseable ignore = derivedContext.push(false)) {
-            return delegate().execute(derivedContext, req);
-        }
-    }
-
-    /**
      * This should be called when retrying is finished.
      */
     protected static void onRetryingComplete(ClientRequestContext ctx) {
         ctx.logBuilder().endResponseWithLastChild();
     }
 
-    protected RetryStrategy<I, O> retryStrategy() {
+    /**
+     * Returns the {@link RetryStrategy}.
+     *
+     * @throws IllegalStateException if the {@link RetryStrategy} is not set
+     */
+    protected RetryStrategy retryStrategy() {
+        checkState(retryStrategy != null, "retryStrategy is not set.");
         return retryStrategy;
+    }
+
+    /**
+     * Returns the {@link RetryStrategyWithContent}.
+     *
+     * @throws IllegalStateException if the {@link RetryStrategyWithContent} is not set
+     */
+    protected RetryStrategyWithContent<O> retryStrategyWithContent() {
+        checkState(retryStrategyWithContent != null, "retryStrategyWithContent is not set.");
+        return retryStrategyWithContent;
     }
 
     /**
@@ -123,7 +162,8 @@ public abstract class RetryingClient<I extends Request, O extends Response>
                 scheduledFuture.addListener(future -> {
                     if (future.isCancelled()) {
                         // future is cancelled when the client factory is closed.
-                        actionOnException.accept(ClosedClientFactoryException.get());
+                        actionOnException.accept(new IllegalStateException(
+                                ClientFactory.class.getSimpleName() + " has been closed."));
                     }
                 });
             }
@@ -196,6 +236,18 @@ public abstract class RetryingClient<I extends Request, O extends Response>
         }
 
         return nextDelay;
+    }
+
+    /**
+     * Returns the total number of attempts of the current request represented by the specified
+     * {@link ClientRequestContext}.
+     */
+    protected static int getTotalAttempts(ClientRequestContext ctx) {
+        final State state = ctx.attr(STATE).get();
+        if (state == null) {
+            return 0;
+        }
+        return state.totalAttemptNo;
     }
 
     private static class State {

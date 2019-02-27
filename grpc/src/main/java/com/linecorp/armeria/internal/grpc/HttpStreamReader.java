@@ -18,20 +18,27 @@ package com.linecorp.armeria.internal.grpc;
 
 import static java.util.Objects.requireNonNull;
 
-import java.util.function.BiConsumer;
+import java.util.Base64;
+import java.util.function.BiFunction;
 
 import javax.annotation.Nullable;
 
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.protobuf.InvalidProtocolBufferException;
 
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.HttpStatusClass;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
+import com.linecorp.armeria.common.grpc.StatusCauseException;
+import com.linecorp.armeria.common.grpc.ThrowableProto;
 
 import io.grpc.Decompressor;
 import io.grpc.DecompressorRegistry;
@@ -40,7 +47,9 @@ import io.grpc.Status;
 /**
  * A {@link Subscriber} to read HTTP messages and pass to gRPC business logic.
  */
-public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void, Throwable> {
+public class HttpStreamReader implements Subscriber<HttpObject>, BiFunction<Void, Throwable, Void> {
+
+    private static final Logger logger = LoggerFactory.getLogger(HttpStreamReader.class);
 
     private final DecompressorRegistry decompressorRegistry;
     private final TransportStatusListener transportStatusListener;
@@ -125,12 +134,16 @@ public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void
             if (grpcStatus != null) {
                 Status status = Status.fromCodeValue(Integer.valueOf(grpcStatus));
                 if (status.getCode() == Status.OK.getCode()) {
-                   // Successful response, finish delivering messages before returning the status.
-                   closeDeframer();
+                    // Successful response, finish delivering messages before returning the status.
+                    closeDeframer();
                 }
                 final String grpcMessage = headers.get(GrpcHeaderNames.GRPC_MESSAGE);
                 if (grpcMessage != null) {
-                    status = status.withDescription(grpcMessage);
+                    status = status.withDescription(StatusMessageEscaper.unescape(grpcMessage));
+                }
+                final String grpcThrowable = headers.get(GrpcHeaderNames.ARMERIA_GRPC_THROWABLEPROTO_BIN);
+                if (grpcThrowable != null) {
+                    status = addCause(status, grpcThrowable);
                 }
                 transportStatusListener.transportReportStatus(status);
                 return;
@@ -175,9 +188,9 @@ public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void
     }
 
     @Override
-    public void accept(Void unused, Throwable cause) {
+    public Void apply(@Nullable Void unused, @Nullable Throwable cause) {
         if (cancelled) {
-            return;
+            return null;
         }
 
         if (cause == null) {
@@ -185,6 +198,8 @@ public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void
         } else {
             transportStatusListener.transportReportStatus(GrpcStatus.fromThrowable(cause));
         }
+
+        return null;
     }
 
     public void cancel() {
@@ -200,7 +215,7 @@ public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void
     private void closeDeframer() {
         if (!deframer.isClosed()) {
             deframer.deframe(HttpData.EMPTY_DATA, true);
-            deframer.close();
+            deframer.closeWhenComplete();
         }
     }
 
@@ -209,5 +224,23 @@ public class HttpStreamReader implements Subscriber<HttpObject>, BiConsumer<Void
         if (deframer.isStalled()) {
             subscription.request(1);
         }
+    }
+
+    private static Status addCause(Status status, String serializedThrowableProto) {
+        final byte[] decoded;
+        try {
+            decoded = Base64.getDecoder().decode(serializedThrowableProto);
+        } catch (IllegalArgumentException e) {
+            logger.warn("Invalid Base64 in status cause proto, ignoring.", e);
+            return status;
+        }
+        final ThrowableProto grpcThrowableProto;
+        try {
+            grpcThrowableProto = ThrowableProto.parseFrom(decoded);
+        } catch (InvalidProtocolBufferException e) {
+            logger.warn("Invalid serialized status cause proto, ignoring.", e);
+            return status;
+        }
+        return status.withCause(new StatusCauseException(grpcThrowableProto));
     }
 }

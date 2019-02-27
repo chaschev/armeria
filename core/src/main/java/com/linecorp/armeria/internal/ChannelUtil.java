@@ -20,12 +20,19 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLSession;
+
 import com.google.common.collect.ImmutableList;
+
+import com.linecorp.armeria.common.SessionProtocol;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.epoll.EpollEventLoopGroup;
+import io.netty.handler.ssl.SslHandler;
 
 public final class ChannelUtil {
 
@@ -41,6 +48,9 @@ public final class ChannelUtil {
             throw new IllegalStateException("failed to locate EpollEventLoop class", e);
         }
     }
+
+    private static final WriteBufferWaterMark DISABLED_WRITE_BUFFER_WATERMARK =
+            new WriteBufferWaterMark(0, Integer.MAX_VALUE);
 
     public static Class<? extends EventLoopGroup> epollEventLoopClass() {
         return EPOLL_EVENT_LOOP_CLASS;
@@ -65,6 +75,44 @@ public final class ChannelUtil {
         }
 
         return future;
+    }
+
+    /**
+     * Disables the write buffer water mark of the specified {@link Channel}, because we do not use this
+     * feature at all and thus we do not want {@code channelWritabilityChanged} events triggered often.
+     */
+    public static void disableWriterBufferWatermark(Channel channel) {
+        channel.config().setWriteBufferWaterMark(DISABLED_WRITE_BUFFER_WATERMARK);
+    }
+
+    /**
+     * Finds the {@link SSLSession} of the current TLS connection.
+     *
+     * @return the {@link SSLSession} if found, or {@code null} if {@link SessionProtocol} is not TLS,
+     *         the {@link SSLSession} is not found or {@link Channel} is {@code null}.
+     */
+    @Nullable
+    public static SSLSession findSslSession(@Nullable Channel channel, SessionProtocol sessionProtocol) {
+        if (!sessionProtocol.isTls()) {
+            return null;
+        }
+
+        return findSslSession(channel);
+    }
+
+    /**
+     * Finds the {@link SSLSession} of the current TLS connection.
+     *
+     * @return the {@link SSLSession} if found, or {@code null} if not found or {@link Channel} is {@code null}.
+     */
+    @Nullable
+    public static SSLSession findSslSession(@Nullable Channel channel) {
+        if (channel == null) {
+            return null;
+        }
+
+        final SslHandler sslHandler = channel.pipeline().get(SslHandler.class);
+        return sslHandler != null ? sslHandler.engine().getSession() : null;
     }
 
     private ChannelUtil() {}

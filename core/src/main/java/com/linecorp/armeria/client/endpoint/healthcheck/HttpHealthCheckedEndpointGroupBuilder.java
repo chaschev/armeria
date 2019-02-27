@@ -21,9 +21,13 @@ import static com.linecorp.armeria.client.endpoint.healthcheck.HealthCheckedEndp
 import static java.util.Objects.requireNonNull;
 
 import java.time.Duration;
+import java.util.function.Function;
 
 import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientFactory;
+import com.linecorp.armeria.client.ClientOptionsBuilder;
+import com.linecorp.armeria.client.Endpoint;
+import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
 import com.linecorp.armeria.common.SessionProtocol;
 
@@ -38,6 +42,8 @@ public class HttpHealthCheckedEndpointGroupBuilder {
     private SessionProtocol protocol = SessionProtocol.HTTP;
     private Duration retryInterval = DEFAULT_HEALTHCHECK_RETRY_INTERVAL;
     private ClientFactory clientFactory = ClientFactory.DEFAULT;
+    private Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator = Function.identity();
+    private int healthCheckPort;
 
     /**
      * Creates a new {@link HttpHealthCheckedEndpointGroupBuilder}. Health check requests for the delegate
@@ -46,6 +52,18 @@ public class HttpHealthCheckedEndpointGroupBuilder {
     public HttpHealthCheckedEndpointGroupBuilder(EndpointGroup delegate, String healthCheckPath) {
         this.delegate = requireNonNull(delegate, "delegate");
         this.healthCheckPath = requireNonNull(healthCheckPath, "healthCheckPath");
+    }
+
+    /**
+     * Sets the port where a health check request will be sent instead of the original port number
+     * specified by {@link EndpointGroup}'s {@link Endpoint}s. This property is useful when your
+     * server listens to health check requests on a different port.
+     */
+    public HttpHealthCheckedEndpointGroupBuilder healthCheckPort(int healthCheckPort) {
+        checkArgument(healthCheckPort > 0 && healthCheckPort <= 65535,
+                      "healthCheckPort: %s (expected: 1-65535)", healthCheckPort);
+        this.healthCheckPort = healthCheckPort;
+        return this;
     }
 
     /**
@@ -78,11 +96,25 @@ public class HttpHealthCheckedEndpointGroupBuilder {
     }
 
     /**
+     * Sets the {@link Function} that customizes an {@link HttpClient} for health check.
+     * <pre>{@code
+     * new HttpHealthCheckedEndpointGroupBuilder(delegate, healthCheckPath)
+     *     .withClientOptions(op -> op.defaultResponseTimeout(Duration.ofSeconds(1)))
+     *     .build();
+     * }</pre>
+     */
+    public HttpHealthCheckedEndpointGroupBuilder withClientOptions(
+            Function<? super ClientOptionsBuilder, ClientOptionsBuilder> configurator) {
+        this.configurator = requireNonNull(configurator, "configurator");
+        return this;
+    }
+
+    /**
      * Returns a newly created {@link HttpHealthCheckedEndpointGroup} based on the contents of the
      * {@link HttpHealthCheckedEndpointGroupBuilder}.
      */
     public HttpHealthCheckedEndpointGroup build() {
         return new HttpHealthCheckedEndpointGroup(clientFactory, delegate, protocol, healthCheckPath,
-                                                  retryInterval);
+                                                  healthCheckPort, retryInterval, configurator);
     }
 }

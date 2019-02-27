@@ -224,6 +224,10 @@ public final class HttpHeaderNames {
      */
     public static final AsciiString EXPIRES = AsciiString.cached("expires");
     /**
+     * {@code "forwarded"}.
+     */
+    public static final AsciiString FORWARDED = AsciiString.cached("forwarded");
+    /**
      * {@code "from"}.
      */
     public static final AsciiString FROM = AsciiString.cached("from");
@@ -254,10 +258,14 @@ public final class HttpHeaderNames {
     /**
      * {@code "keep-alive"}.
      *
-     * @deprecated Use {@link #CONNECTION} instead.
+     * @deprecated Use {@link #CONNECTION}.
      */
     @Deprecated
     public static final AsciiString KEEP_ALIVE = AsciiString.cached("keep-alive");
+    /**
+     * {@code "last-event-id"}.
+     */
+    public static final AsciiString LAST_EVENT_ID = AsciiString.cached("last-event-id");
     /**
      * {@code "last-modified"}.
      */
@@ -297,7 +305,7 @@ public final class HttpHeaderNames {
     /**
      * {@code "proxy-connection"}.
      *
-     * @deprecated Use {@link #CONNECTION} instead.
+     * @deprecated Use {@link #CONNECTION}.
      */
     @Deprecated
     public static final AsciiString PROXY_CONNECTION = AsciiString.cached("proxy-connection");
@@ -410,14 +418,18 @@ public final class HttpHeaderNames {
      */
     public static final AsciiString WWW_AUTHENTICATE = AsciiString.cached("www-authenticate");
     /**
+     * {@code "x-forwarded-for"}.
+     */
+    public static final AsciiString X_FORWARDED_FOR = AsciiString.cached("x-forwarded-for");
+    /**
      * {@code "x-frame-options"}.
      */
     public static final AsciiString X_FRAME_OPTIONS = AsciiString.cached("x-frame-options");
 
-    private static final Map<String, AsciiString> map;
+    private static final Map<CharSequence, AsciiString> map;
 
     static {
-        final ImmutableMap.Builder<String, AsciiString> builder = ImmutableMap.builder();
+        final ImmutableMap.Builder<CharSequence, AsciiString> builder = ImmutableMap.builder();
         for (Field f : HttpHeaderNames.class.getDeclaredFields()) {
             final int m = f.getModifiers();
             if (Modifier.isPublic(m) && Modifier.isStatic(m) && Modifier.isFinal(m) &&
@@ -428,6 +440,7 @@ public final class HttpHeaderNames {
                 } catch (Exception e) {
                     throw new Error(e);
                 }
+                builder.put(name, name);
                 builder.put(name.toString(), name);
             }
         }
@@ -439,10 +452,25 @@ public final class HttpHeaderNames {
      * a known header name, this method will return a pre-instantiated {@link AsciiString} to reduce
      * the allocation rate of {@link AsciiString}.
      */
-    public static AsciiString of(String name) {
-        name = Ascii.toLowerCase(requireNonNull(name, "name"));
-        final AsciiString asciiName = map.get(name);
-        return asciiName != null ? asciiName : AsciiString.cached(name);
+    public static AsciiString of(CharSequence name) {
+        if (name instanceof AsciiString) {
+            return of((AsciiString) name);
+        }
+
+        final String lowerCased = Ascii.toLowerCase(requireNonNull(name, "name"));
+        final AsciiString cached = map.get(lowerCased);
+        return cached != null ? cached : AsciiString.cached(lowerCased);
+    }
+
+    /**
+     * Lower-cases and converts the specified header name into an {@link AsciiString}. If {@code name} is
+     * a known header name, this method will return a pre-instantiated {@link AsciiString} to reduce
+     * the allocation rate of {@link AsciiString}.
+     */
+    public static AsciiString of(AsciiString name) {
+        final AsciiString lowerCased = name.toLowerCase();
+        final AsciiString cached = map.get(lowerCased);
+        return cached != null ? cached : lowerCased;
     }
 
     private HttpHeaderNames() {}

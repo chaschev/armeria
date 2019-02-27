@@ -24,27 +24,37 @@ import static com.linecorp.armeria.common.SessionProtocol.PROXY;
 import static com.linecorp.armeria.server.ServerConfig.validateDefaultMaxRequestLength;
 import static com.linecorp.armeria.server.ServerConfig.validateDefaultRequestTimeoutMillis;
 import static com.linecorp.armeria.server.ServerConfig.validateNonNegative;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_FRAME_SIZE_LOWER_BOUND;
+import static io.netty.handler.codec.http2.Http2CodecUtil.MAX_FRAME_SIZE_UPPER_BOUND;
 import static java.util.Objects.requireNonNull;
 
 import java.io.File;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.charset.Charset;
 import java.security.cert.CertificateException;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executor;
-import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLException;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 
 import com.linecorp.armeria.common.CommonPools;
 import com.linecorp.armeria.common.Flags;
@@ -52,11 +62,13 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.SessionProtocol;
-import com.linecorp.armeria.common.logging.RequestLog;
+import com.linecorp.armeria.common.logging.ContentPreviewer;
+import com.linecorp.armeria.common.logging.ContentPreviewerFactory;
+import com.linecorp.armeria.internal.ArmeriaHttpUtil;
 import com.linecorp.armeria.server.annotation.ExceptionHandlerFunction;
 import com.linecorp.armeria.server.annotation.RequestConverterFunction;
 import com.linecorp.armeria.server.annotation.ResponseConverterFunction;
-import com.linecorp.armeria.server.logging.AccessLogWriters;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
@@ -66,6 +78,7 @@ import io.netty.channel.epoll.EpollChannelOption;
 import io.netty.handler.ssl.SslContext;
 import io.netty.util.DomainNameMapping;
 import io.netty.util.DomainNameMappingBuilder;
+import io.netty.util.concurrent.GlobalEventExecutor;
 import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 
 /**
@@ -122,6 +135,7 @@ public final class ServerBuilder {
     private static final Duration DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT = Duration.ZERO;
     private static final String DEFAULT_SERVICE_LOGGER_PREFIX = "armeria.services";
     private static final int PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE = 65535 - 216;
+    private static final String DEFAULT_ACCESS_LOGGER_PREFIX = "com.linecorp.armeria.logging.access";
 
     // Prohibit deprecate option
     @SuppressWarnings("deprecation")
@@ -143,25 +157,41 @@ public final class ServerBuilder {
     private VirtualHost defaultVirtualHost;
     private EventLoopGroup workerGroup = CommonPools.workerGroup();
     private boolean shutdownWorkerGroupOnStop;
+    private Executor startStopExecutor = GlobalEventExecutor.INSTANCE;
     private final Map<ChannelOption<?>, Object> channelOptions = new Object2ObjectArrayMap<>();
     private final Map<ChannelOption<?>, Object> childChannelOptions = new Object2ObjectArrayMap<>();
     private int maxNumConnections = Flags.maxNumConnections();
     private long idleTimeoutMillis = Flags.defaultServerIdleTimeoutMillis();
     private long defaultRequestTimeoutMillis = Flags.defaultRequestTimeoutMillis();
     private long defaultMaxRequestLength = Flags.defaultMaxRequestLength();
-    private int maxHttp1InitialLineLength = Flags.defaultMaxHttp1InitialLineLength();
-    private int maxHttp1HeaderSize = Flags.defaultMaxHttp1HeaderSize();
-    private int maxHttp1ChunkSize = Flags.defaultMaxHttp1ChunkSize();
+    private boolean verboseResponses = Flags.verboseResponses();
+    private int http2InitialConnectionWindowSize = Flags.defaultHttp2InitialConnectionWindowSize();
+    private int http2InitialStreamWindowSize = Flags.defaultHttp2InitialStreamWindowSize();
+    private long http2MaxStreamsPerConnection = Flags.defaultHttp2MaxStreamsPerConnection();
+    private int http2MaxFrameSize = Flags.defaultHttp2MaxFrameSize();
+    private long http2MaxHeaderListSize = Flags.defaultHttp2MaxHeaderListSize();
+    private int http1MaxInitialLineLength = Flags.defaultHttp1MaxInitialLineLength();
+    private int http1MaxHeaderSize = Flags.defaultHttp1MaxHeaderSize();
+    private int http1MaxChunkSize = Flags.defaultHttp1MaxChunkSize();
     private int proxyProtocolMaxTlvSize = PROXY_PROTOCOL_DEFAULT_MAX_TLV_SIZE;
     private Duration gracefulShutdownQuietPeriod = DEFAULT_GRACEFUL_SHUTDOWN_QUIET_PERIOD;
     private Duration gracefulShutdownTimeout = DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT;
     private Executor blockingTaskExecutor = CommonPools.blockingTaskExecutor();
     private MeterRegistry meterRegistry = Metrics.globalRegistry;
     private String serviceLoggerPrefix = DEFAULT_SERVICE_LOGGER_PREFIX;
-    private Consumer<RequestLog> accessLogWriter = AccessLogWriters.disabled();
+    private AccessLogWriter accessLogWriter = AccessLogWriter.disabled();
+    private boolean shutdownAccessLogWriterOnStop = true;
+    private List<ClientAddressSource> clientAddressSources = ClientAddressSource.DEFAULT_SOURCES;
+    private Predicate<InetAddress> clientAddressTrustedProxyFilter = address -> false;
+    private Predicate<InetAddress> clientAddressFilter = address -> true;
+    private ContentPreviewerFactory requestContentPreviewerFactory = ContentPreviewerFactory.disabled();
+    private ContentPreviewerFactory responseContentPreviewerFactory = ContentPreviewerFactory.disabled();
 
     @Nullable
     private Function<Service<HttpRequest, HttpResponse>, Service<HttpRequest, HttpResponse>> decorator;
+
+    private Function<VirtualHost, Logger> accessLoggerMapper = host -> LoggerFactory.getLogger(
+            defaultAccessLoggerName(host.hostnamePattern()));
 
     /**
      * Adds an HTTP port that listens on all available network interfaces.
@@ -322,12 +352,7 @@ public final class ServerBuilder {
      * @see <a href="#no_port_specified">What happens if no HTTP(S) port is specified?</a>
      */
     public ServerBuilder port(ServerPort port) {
-        requireNonNull(port, "port");
-        if (port.localAddress().getPort() != 0) {
-            ports.forEach(p -> checkArgument(!p.localAddress().equals(port.localAddress()),
-                                             "duplicate local address: %s", port.localAddress()));
-        }
-        ports.add(port);
+        ports.add(requireNonNull(port, "port"));
         return this;
     }
 
@@ -394,6 +419,16 @@ public final class ServerBuilder {
     }
 
     /**
+     * Sets the {@link Executor} which will invoke the callbacks of {@link Server#start()},
+     * {@link Server#stop()} and {@link ServerListener}. If not set, {@link GlobalEventExecutor} will be used
+     * by default.
+     */
+    public ServerBuilder startStopExecutor(Executor startStopExecutor) {
+        this.startStopExecutor = requireNonNull(startStopExecutor, "startStopExecutor");
+        return this;
+    }
+
+    /**
      * Sets the maximum allowed number of open connections.
      */
     public ServerBuilder maxNumConnections(int maxNumConnections) {
@@ -450,7 +485,7 @@ public final class ServerBuilder {
      * Sets the maximum allowed length of the content decoded at the session layer.
      * e.g. the content length of an HTTP request.
      *
-     *  @param defaultMaxRequestLength the maximum allowed length. {@code 0} disables the length limit.
+     * @param defaultMaxRequestLength the maximum allowed length. {@code 0} disables the length limit.
      */
     public ServerBuilder defaultMaxRequestLength(long defaultMaxRequestLength) {
         this.defaultMaxRequestLength = validateDefaultMaxRequestLength(defaultMaxRequestLength);
@@ -458,19 +493,103 @@ public final class ServerBuilder {
     }
 
     /**
+     * Sets whether the verbose response mode is enabled. When enabled, the server responses will contain
+     * the exception type and its full stack trace, which may be useful for debugging while potentially
+     * insecure. When disabled, the server responses will not expose such server-side details to the client.
+     * The default value of this property is retrieved from {@link Flags#verboseResponses()}.
+     */
+    public ServerBuilder verboseResponses(boolean verboseResponses) {
+        this.verboseResponses = verboseResponses;
+        return this;
+    }
+
+    /**
+     * Sets the initial connection-level HTTP/2 flow control window size. Larger values can lower stream
+     * warmup time at the expense of being easier to overload the server. Defaults to
+     * {@link Flags#defaultHttp2InitialConnectionWindowSize()}.
+     * Note that this setting affects the connection-level window size, not the window size of streams.
+     *
+     * @see #http2InitialStreamWindowSize(int)
+     */
+    public ServerBuilder http2InitialConnectionWindowSize(int http2InitialConnectionWindowSize) {
+        checkArgument(http2InitialConnectionWindowSize > 0,
+                      "http2InitialConnectionWindowSize: %s (expected: > 0)",
+                      http2InitialConnectionWindowSize);
+        this.http2InitialConnectionWindowSize = http2InitialConnectionWindowSize;
+        return this;
+    }
+
+    /**
+     * Sets the initial stream-level HTTP/2 flow control window size. Larger values can lower stream
+     * warmup time at the expense of being easier to overload the server. Defaults to
+     * {@link Flags#defaultHttp2InitialStreamWindowSize()}.
+     * Note that this setting affects the stream-level window size, not the window size of connections.
+     *
+     * @see #http2InitialConnectionWindowSize(int)
+     */
+    public ServerBuilder http2InitialStreamWindowSize(int http2InitialStreamWindowSize) {
+        checkArgument(http2InitialStreamWindowSize > 0,
+                      "http2InitialStreamWindowSize: %s (expected: > 0)",
+                      http2InitialStreamWindowSize);
+        this.http2InitialStreamWindowSize = http2InitialStreamWindowSize;
+        return this;
+    }
+
+    /**
+     * Sets the maximum number of concurrent streams per HTTP/2 connection. Unset means there is
+     * no limit on the number of concurrent streams. Note, this differs from {@link #maxNumConnections()},
+     * which is the maximum number of HTTP/2 connections themselves, not the streams that are
+     * multiplexed over each.
+     */
+    public ServerBuilder http2MaxStreamsPerConnection(long http2MaxStreamsPerConnection) {
+        checkArgument(http2MaxStreamsPerConnection > 0 &&
+                      http2MaxStreamsPerConnection <= 0xFFFFFFFFL,
+                      "http2MaxStreamsPerConnection: %s (expected: a positive 32-bit unsigned integer)",
+                      http2MaxStreamsPerConnection);
+        this.http2MaxStreamsPerConnection = http2MaxStreamsPerConnection;
+        return this;
+    }
+
+    /**
+     * Sets the maximum size of HTTP/2 frame that can be received. Defaults to
+     * {@link Flags#defaultHttp2MaxFrameSize()}.
+     */
+    public ServerBuilder http2MaxFrameSize(int http2MaxFrameSize) {
+        checkArgument(http2MaxFrameSize >= MAX_FRAME_SIZE_LOWER_BOUND &&
+                      http2MaxFrameSize <= MAX_FRAME_SIZE_UPPER_BOUND,
+                      "http2MaxFramSize: %s (expected: >= %s and <= %s)",
+                      http2MaxFrameSize, MAX_FRAME_SIZE_LOWER_BOUND, MAX_FRAME_SIZE_UPPER_BOUND);
+        this.http2MaxFrameSize = http2MaxFrameSize;
+        return this;
+    }
+
+    /**
+     * Sets the maximum size of headers that can be received. Defaults to
+     * {@link Flags#defaultHttp2MaxHeaderListSize()}.
+     */
+    public ServerBuilder http2MaxHeaderListSize(long http2MaxHeaderListSize) {
+        checkArgument(http2MaxHeaderListSize > 0 &&
+                      http2MaxHeaderListSize <= 0xFFFFFFFFL,
+                      "http2MaxHeaderListSize: %s (expected: a positive 32-bit unsigned integer)",
+                      http2MaxHeaderListSize);
+        this.http2MaxHeaderListSize = http2MaxHeaderListSize;
+        return this;
+    }
+
+    /**
      * Sets the maximum length of an HTTP/1 response initial line.
      */
-    public ServerBuilder maxHttp1InitialLineLength(int maxHttp1InitialLineLength) {
-        this.maxHttp1InitialLineLength = validateNonNegative(
-                maxHttp1InitialLineLength, "maxHttp1InitialLineLength");
+    public ServerBuilder http1MaxInitialLineLength(int http1MaxInitialLineLength) {
+        this.http1MaxInitialLineLength = validateNonNegative(
+                http1MaxInitialLineLength, "http1MaxInitialLineLength");
         return this;
     }
 
     /**
      * Sets the maximum length of all headers in an HTTP/1 response.
      */
-    public ServerBuilder maxHttp1HeaderSize(int maxHttp1HeaderSize) {
-        this.maxHttp1HeaderSize = validateNonNegative(maxHttp1HeaderSize, "maxHttp1HeaderSize");
+    public ServerBuilder http1MaxHeaderSize(int http1MaxHeaderSize) {
+        this.http1MaxHeaderSize = validateNonNegative(http1MaxHeaderSize, "http1MaxHeaderSize");
         return this;
     }
 
@@ -479,8 +598,8 @@ public final class ServerBuilder {
      * The content or a chunk longer than this value will be split into smaller chunks
      * so that their lengths never exceed it.
      */
-    public ServerBuilder maxHttp1ChunkSize(int maxHttp1ChunkSize) {
-        this.maxHttp1ChunkSize = validateNonNegative(maxHttp1ChunkSize, "maxHttp1ChunkSize");
+    public ServerBuilder http1MaxChunkSize(int http1MaxChunkSize) {
+        this.http1MaxChunkSize = validateNonNegative(http1MaxChunkSize, "http1MaxChunkSize");
         return this;
     }
 
@@ -552,21 +671,21 @@ public final class ServerBuilder {
 
     /**
      * Sets the format of this {@link Server}'s access log. The specified {@code accessLogFormat} would be
-     * parsed by {@link AccessLogWriters#custom(String)}.
+     * parsed by {@link AccessLogWriter#custom(String)}.
      */
     public ServerBuilder accessLogFormat(String accessLogFormat) {
-        accessLogWriter = AccessLogWriters.custom(requireNonNull(accessLogFormat, "accessLogFormat"));
-        return this;
+        return accessLogWriter(AccessLogWriter.custom(requireNonNull(accessLogFormat, "accessLogFormat")),
+                               true);
     }
 
     /**
-     * Sets an access log writer of this {@link Server}. {@link AccessLogWriters#disabled()} is used by default.
+     * Sets an access log writer of this {@link Server}. {@link AccessLogWriter#disabled()} is used by default.
      *
-     * @see AccessLogWriters to find pre-defined access log writers.
+     * @param shutdownOnStop whether to shut down the {@link AccessLogWriter} when the {@link Server} stops
      */
-    @SuppressWarnings("unchecked")
-    public ServerBuilder accessLogWriter(Consumer<? super RequestLog> accessLogWriter) {
-        this.accessLogWriter = (Consumer<RequestLog>) requireNonNull(accessLogWriter, "accessLogWriter");
+    public ServerBuilder accessLogWriter(AccessLogWriter accessLogWriter, boolean shutdownOnStop) {
+        this.accessLogWriter = requireNonNull(accessLogWriter, "accessLogWriter");
+        shutdownAccessLogWriterOnStop = shutdownOnStop;
         return this;
     }
 
@@ -810,8 +929,8 @@ public final class ServerBuilder {
     public ServerBuilder annotatedService(Object service,
                                           Object... exceptionHandlersAndConverters) {
         return annotatedService("/", service, Function.identity(),
-                                requireNonNull(exceptionHandlersAndConverters,
-                                               "exceptionHandlersAndConverters"));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -826,8 +945,8 @@ public final class ServerBuilder {
                                                   ? extends Service<HttpRequest, HttpResponse>> decorator,
                                           Object... exceptionHandlersAndConverters) {
         return annotatedService("/", service, decorator,
-                                requireNonNull(exceptionHandlersAndConverters,
-                                               "exceptionHandlersAndConverters"));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -847,8 +966,8 @@ public final class ServerBuilder {
     public ServerBuilder annotatedService(String pathPrefix, Object service,
                                           Object... exceptionHandlersAndConverters) {
         return annotatedService(pathPrefix, service, Function.identity(),
-                                requireNonNull(exceptionHandlersAndConverters,
-                                               "exceptionHandlersAndConverters"));
+                                ImmutableList.copyOf(requireNonNull(exceptionHandlersAndConverters,
+                                                                    "exceptionHandlersAndConverters")));
     }
 
     /**
@@ -876,9 +995,25 @@ public final class ServerBuilder {
      *                                       {@link ResponseConverterFunction}
      */
     public ServerBuilder annotatedService(String pathPrefix, Object service,
+                                          Iterable<?> exceptionHandlersAndConverters) {
+        return annotatedService(pathPrefix, service, Function.identity(), exceptionHandlersAndConverters);
+    }
+
+    /**
+     * Binds the specified annotated service object under the specified path prefix.
+     *
+     * @param exceptionHandlersAndConverters an iterable object of {@link ExceptionHandlerFunction},
+     *                                       {@link RequestConverterFunction} and/or
+     *                                       {@link ResponseConverterFunction}
+     */
+    public ServerBuilder annotatedService(String pathPrefix, Object service,
                                           Function<Service<HttpRequest, HttpResponse>,
                                                   ? extends Service<HttpRequest, HttpResponse>> decorator,
                                           Iterable<?> exceptionHandlersAndConverters) {
+        requireNonNull(pathPrefix, "pathPrefix");
+        requireNonNull(service, "service");
+        requireNonNull(decorator, "decorator");
+        requireNonNull(exceptionHandlersAndConverters, "exceptionHandlersAndConverters");
 
         defaultVirtualHostBuilderUpdated();
         defaultVirtualHostBuilder.annotatedService(pathPrefix, service, decorator,
@@ -1003,6 +1138,138 @@ public final class ServerBuilder {
     }
 
     /**
+     * Sets a list of {@link ClientAddressSource}s which are used to determine where to look for the
+     * client address, in the order of preference. {@code Forwarded} header, {@code X-Forwarded-For} header
+     * and the source address of a PROXY protocol header will be used by default.
+     */
+    public ServerBuilder clientAddressSources(ClientAddressSource... clientAddressSources) {
+        this.clientAddressSources = ImmutableList.copyOf(
+                requireNonNull(clientAddressSources, "clientAddressSources"));
+        return this;
+    }
+
+    /**
+     * Sets a list of {@link ClientAddressSource}s which are used to determine where to look for the
+     * client address, in the order of preference. {@code Forwarded} header, {@code X-Forwarded-For} header
+     * and the source address of a PROXY protocol header will be used by default.
+     */
+    public ServerBuilder clientAddressSources(Iterable<ClientAddressSource> clientAddressSources) {
+        this.clientAddressSources = ImmutableList.copyOf(
+                requireNonNull(clientAddressSources, "clientAddressSources"));
+        return this;
+    }
+
+    /**
+     * Sets a filter which evaluates whether an {@link InetAddress} of a remote endpoint is trusted.
+     */
+    public ServerBuilder clientAddressTrustedProxyFilter(
+            Predicate<InetAddress> clientAddressTrustedProxyFilter) {
+        this.clientAddressTrustedProxyFilter =
+                requireNonNull(clientAddressTrustedProxyFilter, "clientAddressTrustedProxyFilter");
+        return this;
+    }
+
+    /**
+     * Sets a filter which evaluates whether an {@link InetAddress} can be used as a client address.
+     */
+    public ServerBuilder clientAddressFilter(Predicate<InetAddress> clientAddressFilter) {
+        this.clientAddressFilter = requireNonNull(clientAddressFilter, "clientAddressFilter");
+        return this;
+    }
+
+    /**
+     * Sets the default access logger mapper for all {@link VirtualHost}s.
+     * The {@link VirtualHost}s which do not have an access logger specified by a {@link VirtualHostBuilder}
+     * will have an access logger set by the {@code mapper} when {@link ServerBuilder#build()} is called.
+     */
+    public ServerBuilder accessLogger(Function<VirtualHost, Logger> mapper) {
+        accessLoggerMapper = requireNonNull(mapper, "mapper");
+        return this;
+    }
+
+    /**
+     * Sets the default access {@link Logger} for all {@link VirtualHost}s.
+     * The {@link VirtualHost}s which do not have an access logger specified by a {@link VirtualHostBuilder}
+     * will have the same access {@link Logger} when {@link ServerBuilder#build()} is called.
+     */
+    public ServerBuilder accessLogger(Logger logger) {
+        requireNonNull(logger, "logger");
+        return accessLogger(host -> logger);
+    }
+
+    /**
+     * Sets the default access logger name for all {@link VirtualHost}s.
+     * The {@link VirtualHost}s which do not have an access logger specified by a {@link VirtualHostBuilder}
+     * will have the same access {@link Logger} named the {@code loggerName}
+     * when {@link ServerBuilder#build()} is called.
+     */
+    public ServerBuilder accessLogger(String loggerName) {
+        requireNonNull(loggerName, "loggerName");
+        return accessLogger(LoggerFactory.getLogger(loggerName));
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a request of this {@link Server}.
+     */
+    public ServerBuilder requestContentPreviewerFactory(ContentPreviewerFactory factory) {
+        requestContentPreviewerFactory = requireNonNull(factory, "factory");
+        return this;
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a response of this {@link Server}.
+     */
+    public ServerBuilder responseContentPreviewerFactory(ContentPreviewerFactory factory) {
+        responseContentPreviewerFactory = requireNonNull(factory, "factory");
+        return this;
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} for a request and a response of this {@link Server}.
+     */
+    public ServerBuilder contentPreviewerFactory(ContentPreviewerFactory factory) {
+        requestContentPreviewerFactory(factory);
+        responseContentPreviewerFactory(factory);
+        return this;
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} creating a {@link ContentPreviewer} which produces the preview
+     * with the maxmium {@code length} limit for a request and a response of this {@link Server}.
+     * The previewer is enabled only if the content type of a request/response meets
+     * any of the following cases.
+     * <ul>
+     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
+     *     <li>when its charset has been specified</li>
+     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
+     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
+     * </ul>
+     * @param length the maximum length of the preview.
+     * @param defaultCharset the default charset for a request/response with unspecified charset in
+     *                       {@code "content-type"} header.
+     */
+    public ServerBuilder contentPreview(int length, Charset defaultCharset) {
+        return contentPreviewerFactory(ContentPreviewerFactory.ofText(length, defaultCharset));
+    }
+
+    /**
+     * Sets the {@link ContentPreviewerFactory} creating a {@link ContentPreviewer} which produces the preview
+     * with the maxmium {@code length} limit for a request and a response of this {@link Server}.
+     * The previewer is enabled only if the content type of a request/response meets
+     * any of the following cases.
+     * <ul>
+     *     <li>when it matches {@code text/*} or {@code application/x-www-form-urlencoded}</li>
+     *     <li>when its charset has been specified</li>
+     *     <li>when its subtype is {@code "xml"} or {@code "json"}</li>
+     *     <li>when its subtype ends with {@code "+xml"} or {@code "+json"}</li>
+     * </ul>
+     * @param length the maximum length of the preview.
+     */
+    public ServerBuilder contentPreview(int length) {
+        return contentPreview(length, ArmeriaHttpUtil.HTTP_DEFAULT_CONTENT_CHARSET);
+    }
+
+    /**
      * Returns a newly-created {@link Server} based on the configuration properties set so far.
      */
     public Server build() {
@@ -1024,11 +1291,40 @@ public final class ServerBuilder {
             virtualHosts = this.virtualHosts;
         }
 
-        final List<ServerPort> ports;
+        // Gets the access logger for each virtual host.
+        virtualHosts.forEach(vh -> {
+            if (vh.accessLoggerOrNull() == null) {
+                final Logger logger = accessLoggerMapper.apply(vh);
+
+                checkState(logger != null, "accessLoggerMapper.apply() has returned null for virtual host: %s.",
+                           vh.hostnamePattern());
+                vh.accessLogger(logger);
+            }
+            // combine content preview factories (one for VirtualHost, the other for Server)
+            vh.requestContentPreviewerFactory(ContentPreviewerFactory.of(vh.requestContentPreviewerFactory(),
+                                                                         requestContentPreviewerFactory));
+            vh.responseContentPreviewerFactory(ContentPreviewerFactory.of(vh.responseContentPreviewerFactory(),
+                                                                          responseContentPreviewerFactory));
+        });
+        if (defaultVirtualHost.accessLoggerOrNull() == null) {
+            final Logger logger = accessLoggerMapper.apply(defaultVirtualHost);
+            checkState(logger != null,
+                       "accessLoggerMapper.apply() has returned null for the default virtual host.");
+            defaultVirtualHost.accessLogger(logger);
+        }
+
+        defaultVirtualHost.requestContentPreviewerFactory(
+                ContentPreviewerFactory.of(defaultVirtualHost.requestContentPreviewerFactory(),
+                                           requestContentPreviewerFactory));
+        defaultVirtualHost.responseContentPreviewerFactory(
+                ContentPreviewerFactory.of(defaultVirtualHost.responseContentPreviewerFactory(),
+                                           responseContentPreviewerFactory));
 
         // Pre-populate the domain name mapping for later matching.
         final DomainNameMapping<SslContext> sslContexts;
         final SslContext defaultSslContext = findDefaultSslContext(defaultVirtualHost, virtualHosts);
+
+        final Collection<ServerPort> ports;
 
         this.ports.forEach(
                 port -> checkState(port.protocols().stream().anyMatch(p -> p != PROXY),
@@ -1038,7 +1334,7 @@ public final class ServerBuilder {
         if (defaultSslContext == null) {
             sslContexts = null;
             if (!this.ports.isEmpty()) {
-                ports = ImmutableList.copyOf(this.ports);
+                ports = resolveDistinctPorts(this.ports);
                 for (final ServerPort p : ports) {
                     if (p.hasTls()) {
                         throw new IllegalArgumentException("TLS not configured; cannot serve HTTPS");
@@ -1049,7 +1345,7 @@ public final class ServerBuilder {
             }
         } else {
             if (!this.ports.isEmpty()) {
-                ports = ImmutableList.copyOf(this.ports);
+                ports = resolveDistinctPorts(this.ports);
             } else {
                 ports = ImmutableList.of(new ServerPort(0, HTTPS));
             }
@@ -1067,15 +1363,50 @@ public final class ServerBuilder {
 
         final Server server = new Server(new ServerConfig(
                 ports, normalizeDefaultVirtualHost(defaultVirtualHost, defaultSslContext), virtualHosts,
-                workerGroup, shutdownWorkerGroupOnStop, maxNumConnections,
-                idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength,
-                maxHttp1InitialLineLength, maxHttp1HeaderSize, maxHttp1ChunkSize,
+                workerGroup, shutdownWorkerGroupOnStop, startStopExecutor, maxNumConnections,
+                idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength, verboseResponses,
+                http2InitialConnectionWindowSize, http2InitialStreamWindowSize, http2MaxStreamsPerConnection,
+                http2MaxFrameSize, http2MaxHeaderListSize,
+                http1MaxInitialLineLength, http1MaxHeaderSize, http1MaxChunkSize,
                 gracefulShutdownQuietPeriod, gracefulShutdownTimeout, blockingTaskExecutor,
-                meterRegistry, serviceLoggerPrefix, accessLogWriter,
-                proxyProtocolMaxTlvSize, channelOptions, childChannelOptions), sslContexts);
+                meterRegistry, serviceLoggerPrefix, accessLogWriter, shutdownAccessLogWriterOnStop,
+                proxyProtocolMaxTlvSize, channelOptions, childChannelOptions,
+                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter), sslContexts);
 
         serverListeners.forEach(server::addListener);
         return server;
+    }
+
+    /**
+     * Returns a list of {@link ServerPort}s which consists of distinct port numbers except for the port
+     * {@code 0}. If there are the same port numbers with different {@link SessionProtocol}s,
+     * their {@link SessionProtocol}s will be merged into a single {@link ServerPort} instance.
+     * The returned list is sorted as the same order of the specified {@code ports}.
+     */
+    private static List<ServerPort> resolveDistinctPorts(List<ServerPort> ports) {
+        final List<ServerPort> distinctPorts = new ArrayList<>();
+        for (final ServerPort p : ports) {
+            boolean found = false;
+            // Do not check the port number 0 because a user may want his or her server to be bound
+            // on multiple arbitrary ports.
+            if (p.localAddress().getPort() > 0) {
+                for (int i = 0; i < distinctPorts.size(); i++) {
+                    final ServerPort port = distinctPorts.get(i);
+                    if (port.localAddress().equals(p.localAddress())) {
+                        final ServerPort merged =
+                                new ServerPort(port.localAddress(),
+                                               Sets.union(port.protocols(), p.protocols()));
+                        distinctPorts.set(i, merged);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                distinctPorts.add(p);
+            }
+        }
+        return Collections.unmodifiableList(distinctPorts);
     }
 
     private VirtualHost normalizeDefaultVirtualHost(VirtualHost h,
@@ -1085,7 +1416,9 @@ public final class ServerBuilder {
                 h.defaultHostname(), "*", sslCtx,
                 h.serviceConfigs().stream().map(
                         e -> new ServiceConfig(e.pathMapping(), e.service(), e.loggerName().orElse(null)))
-                 .collect(Collectors.toList()), h.producibleMediaTypes(), rejectedPathMappingHandler);
+                 .collect(Collectors.toList()), h.producibleMediaTypes(),
+                rejectedPathMappingHandler, host -> h.accessLogger(), h.requestContentPreviewerFactory(),
+                h.responseContentPreviewerFactory());
     }
 
     @Nullable
@@ -1103,15 +1436,36 @@ public final class ServerBuilder {
         return lastSslContext;
     }
 
+    private static String defaultAccessLoggerName(String hostnamePattern) {
+        requireNonNull(hostnamePattern, "hostnamePattern");
+        final String[] elements = hostnamePattern.split("\\.");
+        final StringBuilder name = new StringBuilder(
+                DEFAULT_ACCESS_LOGGER_PREFIX.length() + hostnamePattern.length() + 1);
+        name.append(DEFAULT_ACCESS_LOGGER_PREFIX);
+        for (int i = elements.length - 1; i >= 0; i--) {
+            final String element = elements[i];
+            if (element.isEmpty() || "*".equals(element)) {
+                continue;
+            }
+            name.append('.');
+            name.append(element);
+        }
+        return name.toString();
+    }
+
     @Override
     public String toString() {
         return ServerConfig.toString(
                 getClass(), ports, defaultVirtualHost, virtualHosts, workerGroup, shutdownWorkerGroupOnStop,
                 maxNumConnections, idleTimeoutMillis, defaultRequestTimeoutMillis, defaultMaxRequestLength,
-                maxHttp1InitialLineLength, maxHttp1HeaderSize, maxHttp1ChunkSize,
+                verboseResponses, http2InitialConnectionWindowSize, http2InitialStreamWindowSize,
+                http2MaxStreamsPerConnection, http2MaxFrameSize, http2MaxHeaderListSize,
+                http1MaxInitialLineLength, http1MaxHeaderSize, http1MaxChunkSize,
                 proxyProtocolMaxTlvSize, gracefulShutdownQuietPeriod, gracefulShutdownTimeout,
-                blockingTaskExecutor, meterRegistry, serviceLoggerPrefix, accessLogWriter, channelOptions,
-                childChannelOptions
+                blockingTaskExecutor, meterRegistry, serviceLoggerPrefix,
+                accessLogWriter, shutdownAccessLogWriterOnStop,
+                channelOptions, childChannelOptions,
+                clientAddressSources, clientAddressTrustedProxyFilter, clientAddressFilter
         );
     }
 }

@@ -27,6 +27,7 @@ import org.mockito.Mock;
 import org.mockito.junit.MockitoJUnit;
 import org.mockito.junit.MockitoRule;
 
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpStatus;
@@ -37,7 +38,6 @@ import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.testing.internal.AnticipatedException;
 
 import io.netty.channel.Channel;
-import io.netty.util.AsciiString;
 
 public class DefaultRequestLogTest {
 
@@ -123,19 +123,23 @@ public class DefaultRequestLogTest {
         final DefaultRequestLog child = new DefaultRequestLog(ctx);
         log.addChild(child);
         child.startRequest(channel, SessionProtocol.H2C);
-        assertThat(log.requestStartTimeMillis()).isEqualTo(child.requestStartTimeMillis());
+        assertThat(log.requestStartTimeMicros()).isEqualTo(child.requestStartTimeMicros());
         assertThat(log.channel()).isSameAs(channel);
         assertThat(log.sessionProtocol()).isSameAs(SessionProtocol.H2C);
 
         child.serializationFormat(SerializationFormat.NONE);
         assertThat(log.serializationFormat()).isSameAs(SerializationFormat.NONE);
 
-        final HttpHeaders foo = HttpHeaders.of(AsciiString.of("foo"), "foo");
+        child.requestFirstBytesTransferred();
+        assertThat(log.requestFirstBytesTransferredTimeNanos())
+                .isEqualTo(child.requestFirstBytesTransferredTimeNanos());
+
+        final HttpHeaders foo = HttpHeaders.of(HttpHeaderNames.of("foo"), "foo");
         child.requestHeaders(foo);
         assertThat(log.requestHeaders()).isSameAs(foo);
 
         final String requestContent = "baz";
-        final String rawRequestContent = "bax";
+        final String rawRequestContent = "qux";
 
         child.requestContent(requestContent, rawRequestContent);
         assertThat(log.requestContent()).isSameAs(requestContent);
@@ -146,20 +150,27 @@ public class DefaultRequestLogTest {
 
         // response-side log are propagated when RequestLogBuilder.endResponseWithLastChild() is invoked
         child.startResponse();
-        assertThatThrownBy(() -> log.responseStartTimeMillis())
+        assertThatThrownBy(() -> log.responseStartTimeMicros())
                 .isExactlyInstanceOf(RequestLogAvailabilityException.class);
 
-        final HttpHeaders bar = HttpHeaders.of(AsciiString.of("bar"), "bar");
+        child.responseFirstBytesTransferred();
+        assertThatThrownBy(() -> log.responseFirstBytesTransferredTimeNanos())
+                .isExactlyInstanceOf(RequestLogAvailabilityException.class);
+
+        final HttpHeaders bar = HttpHeaders.of(HttpHeaderNames.of("bar"), "bar");
         child.responseHeaders(bar);
         assertThatThrownBy(() -> log.responseHeaders())
                 .isExactlyInstanceOf(RequestLogAvailabilityException.class);
 
         log.endResponseWithLastChild();
-        assertThat(log.responseStartTimeMillis()).isEqualTo(child.responseStartTimeMillis());
+        assertThat(log.responseStartTimeMicros()).isEqualTo(child.responseStartTimeMicros());
+
+        assertThat(log.responseFirstBytesTransferredTimeNanos())
+                .isEqualTo(child.responseFirstBytesTransferredTimeNanos());
         assertThat(log.responseHeaders()).isSameAs(bar);
 
         final String responseContent = "baz1";
-        final String rawResponseContent = "bax1";
+        final String rawResponseContent = "qux1";
         child.responseContent(responseContent, rawResponseContent);
         assertThat(log.responseContent()).isSameAs(responseContent);
         assertThat(log.rawResponseContent()).isSameAs(rawResponseContent);

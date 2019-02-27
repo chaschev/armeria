@@ -23,6 +23,7 @@ import java.util.Iterator;
 import java.util.function.Consumer;
 
 import javax.annotation.Nullable;
+import javax.net.ssl.SSLSession;
 
 import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.HttpHeaders;
@@ -37,7 +38,7 @@ import com.linecorp.armeria.common.logging.RequestLogBuilder;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.buffer.ByteBufAllocator;
-import io.netty.buffer.UnpooledByteBufAllocator;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.EventLoop;
 import io.netty.handler.codec.Headers;
@@ -88,7 +89,8 @@ public class DefaultClientRequestContext extends NonWrappingRequestContext imple
         this.endpoint = requireNonNull(endpoint, "endpoint");
         this.fragment = fragment;
 
-        log = new DefaultRequestLog(this);
+        log = new DefaultRequestLog(this, options.requestContentPreviewerFactory(),
+                                    options.responseContentPreviewerFactory());
 
         writeTimeoutMillis = options.defaultWriteTimeoutMillis();
         responseTimeoutMillis = options.defaultResponseTimeoutMillis();
@@ -130,7 +132,8 @@ public class DefaultClientRequestContext extends NonWrappingRequestContext imple
         endpoint = ctx.endpoint();
         fragment = ctx.fragment();
 
-        log = new DefaultRequestLog(this);
+        log = new DefaultRequestLog(this, options.requestContentPreviewerFactory(),
+                                    options.responseContentPreviewerFactory());
 
         writeTimeoutMillis = ctx.writeTimeoutMillis();
         responseTimeoutMillis = ctx.responseTimeoutMillis();
@@ -176,6 +179,16 @@ public class DefaultClientRequestContext extends NonWrappingRequestContext imple
     @Override
     public EventLoop eventLoop() {
         return eventLoop;
+    }
+
+    @Nullable
+    @Override
+    public SSLSession sslSession() {
+        if (log.isAvailable(RequestLogAvailability.REQUEST_START)) {
+            return log.sslSession();
+        } else {
+            return null;
+        }
     }
 
     @Override
@@ -333,6 +346,6 @@ public class DefaultClientRequestContext extends NonWrappingRequestContext imple
     @Override
     public ByteBufAllocator alloc() {
         final Channel channel = channel();
-        return channel != null ? channel.alloc() : UnpooledByteBufAllocator.DEFAULT;
+        return channel != null ? channel.alloc() : PooledByteBufAllocator.DEFAULT;
     }
 }

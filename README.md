@@ -12,7 +12,7 @@ by [LINE Corporation](https://linecorp.com/en/), who uses it in production.
 
 ## How to build
 
-We use [Gradle](https://gradle.org/) to build Armeria. The following command will compile Armeria and generate
+We use [Gradle](https://gradle.org/) and [Java 11 or later](https://adoptopenjdk.net/) to build Armeria. The following command will compile Armeria and generate
 JARs and web site:
 
 ```bash
@@ -22,7 +22,7 @@ $ ./gradlew build
 ## How to ask a question
 
 Just [create a new issue](https://github.com/line/armeria/issues/new) to ask a question, and browse
-[the list of previously answered questions](https://github.com/line/armeria/issues?q=label%3Aquestion-answered).
+[the list of previously answered questions](https://github.com/line/armeria/issues?q=label%3Aquestion).
 
 We also have [a Slack workspace](https://line-slacknow.herokuapp.com/line-armeria/).
 

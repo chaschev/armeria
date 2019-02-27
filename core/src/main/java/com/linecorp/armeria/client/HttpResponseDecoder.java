@@ -18,6 +18,7 @@ package com.linecorp.armeria.client;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import javax.annotation.Nullable;
@@ -37,7 +38,7 @@ import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.internal.InboundTrafficController;
 
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.EventLoop;
 import io.netty.util.collection.IntObjectHashMap;
 import io.netty.util.collection.IntObjectMap;
 import io.netty.util.concurrent.ScheduledFuture;
@@ -51,9 +52,9 @@ abstract class HttpResponseDecoder {
     private final InboundTrafficController inboundTrafficController;
     private boolean disconnectWhenFinished;
 
-    HttpResponseDecoder(Channel channel) {
+    HttpResponseDecoder(Channel channel, InboundTrafficController inboundTrafficController) {
         this.channel = channel;
-        inboundTrafficController = new InboundTrafficController(channel);
+        this.inboundTrafficController = inboundTrafficController;
     }
 
     final Channel channel() {
@@ -93,6 +94,10 @@ abstract class HttpResponseDecoder {
         return responses.remove(id);
     }
 
+    final int unfinishedResponses() {
+        return responses.size();
+    }
+
     final boolean hasUnfinishedResponses() {
         return !responses.isEmpty();
     }
@@ -111,8 +116,12 @@ abstract class HttpResponseDecoder {
         disconnectWhenFinished = true;
     }
 
-    final boolean needsToDisconnect() {
+    final boolean needsToDisconnectNow() {
         return disconnectWhenFinished && !hasUnfinishedResponses();
+    }
+
+    final boolean needsToDisconnectWhenFinished() {
+        return disconnectWhenFinished;
     }
 
     static final class HttpResponseWrapper implements StreamWriter<HttpObject>, Runnable {
@@ -124,6 +133,8 @@ abstract class HttpResponseDecoder {
         private final long maxContentLength;
         @Nullable
         private ScheduledFuture<?> responseTimeoutFuture;
+
+        private boolean loggedResponseFirstBytesTransferred;
 
         HttpResponseWrapper(@Nullable HttpRequest request, DecodedHttpResponse delegate,
                             RequestLogBuilder logBuilder, long responseTimeoutMillis, long maxContentLength) {
@@ -138,7 +149,7 @@ abstract class HttpResponseDecoder {
             return delegate.completionFuture();
         }
 
-        void scheduleTimeout(ChannelHandlerContext ctx) {
+        void scheduleTimeout(EventLoop eventLoop) {
             if (responseTimeoutFuture != null || responseTimeoutMillis <= 0 || !isOpen()) {
                 // No need to schedule a response timeout if:
                 // - the timeout has been scheduled already,
@@ -147,7 +158,7 @@ abstract class HttpResponseDecoder {
                 return;
             }
 
-            responseTimeoutFuture = ctx.channel().eventLoop().schedule(
+            responseTimeoutFuture = eventLoop.schedule(
                     this, responseTimeoutMillis, TimeUnit.MILLISECONDS);
         }
 
@@ -167,6 +178,13 @@ abstract class HttpResponseDecoder {
 
         long writtenBytes() {
             return delegate.writtenBytes();
+        }
+
+        void logResponseFirstBytesTransferred() {
+            if (!loggedResponseFirstBytesTransferred) {
+                logBuilder.responseFirstBytesTransferred();
+                loggedResponseFirstBytesTransferred = true;
+            }
         }
 
         @Override
@@ -189,7 +207,6 @@ abstract class HttpResponseDecoder {
         public boolean tryWrite(HttpObject o) {
             if (o instanceof HttpHeaders) {
                 // NB: It's safe to call logBuilder.start() multiple times.
-                //     See AbstractMessageLog.start() for more information.
                 logBuilder.startResponse();
                 final HttpHeaders headers = (HttpHeaders) o;
                 final HttpStatus status = headers.status();
@@ -197,7 +214,7 @@ abstract class HttpResponseDecoder {
                     logBuilder.responseHeaders(headers);
                 }
             } else if (o instanceof HttpData) {
-                logBuilder.increaseResponseLength(((HttpData) o).length());
+                logBuilder.increaseResponseLength((HttpData) o);
             }
             return delegate.tryWrite(o);
         }
@@ -212,25 +229,26 @@ abstract class HttpResponseDecoder {
             return delegate.onDemand(task);
         }
 
+        void onSubscriptionCancelled() {
+            close(null, this::cancelAction);
+        }
+
         @Override
         public void close() {
-            if (cancelTimeout()) {
-                delegate.close();
-                logBuilder.endResponse();
-            }
-
-            if (request != null) {
-                request.abort();
-            }
+            close(null, this::closeAction);
         }
 
         @Override
         public void close(Throwable cause) {
+            close(cause, this::closeAction);
+        }
+
+        private void close(@Nullable Throwable cause,
+                           Consumer<Throwable> actionOnTimeoutCancelled) {
             if (cancelTimeout()) {
-                delegate.close(cause);
-                logBuilder.endResponse(cause);
+                actionOnTimeoutCancelled.accept(cause);
             } else {
-                if (!Exceptions.isExpected(cause)) {
+                if (cause != null && !Exceptions.isExpected(cause)) {
                     logger.warn("Unexpected exception:", cause);
                 }
             }
@@ -238,6 +256,20 @@ abstract class HttpResponseDecoder {
             if (request != null) {
                 request.abort();
             }
+        }
+
+        private void closeAction(@Nullable Throwable cause) {
+            if (cause != null) {
+                delegate.close(cause);
+                logBuilder.endResponse(cause);
+            } else {
+                delegate.close();
+                logBuilder.endResponse();
+            }
+        }
+
+        private void cancelAction(@Nullable Throwable cause) {
+            logBuilder.endResponse();
         }
 
         @Override

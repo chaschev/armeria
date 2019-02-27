@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -56,6 +57,7 @@ import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.thrift.ThriftCompletableFuture;
 import com.linecorp.armeria.common.tracing.HelloService;
 import com.linecorp.armeria.common.tracing.HelloService.AsyncIface;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.Service;
@@ -64,8 +66,11 @@ import com.linecorp.armeria.server.thrift.THttpService;
 import com.linecorp.armeria.server.tracing.HttpTracingService;
 import com.linecorp.armeria.testing.server.ServerRule;
 
+import brave.ScopedSpan;
+import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.propagation.CurrentTraceContext;
+import brave.propagation.StrictScopeDecorator;
 import brave.sampler.Sampler;
 import zipkin2.Span;
 import zipkin2.reporter.Reporter;
@@ -103,9 +108,9 @@ public class HttpTracingIntegrationTest {
                         final ThriftCompletableFuture<String> f2 = new ThriftCompletableFuture<>();
                         quxClient.hello(name, f1);
                         quxClient.hello(name, f2);
-                        CompletableFuture.allOf(f1, f2).whenComplete((aVoid, throwable) -> {
+                        CompletableFuture.allOf(f1, f2).whenCompleteAsync((aVoid, throwable) -> {
                             resultHandler.onComplete(f1.join() + ", and " + f2.join());
-                        });
+                        }, RequestContext.current().contextAwareExecutor());
                     })));
 
             sb.service("/qux", decorate("service/qux", THttpService.of(
@@ -122,32 +127,44 @@ public class HttpTracingIntegrationTest {
                     final ListenableFuture<List<Object>> spanAware = allAsList(IntStream.range(1, 3).mapToObj(
                             i -> executorService.submit(
                                     RequestContext.current().makeContextAware(() -> {
+                                        if (i == 2) {
+                                            countDownLatch.countDown();
+                                            countDownLatch.await();
+                                        }
                                         brave.Span span = Tracing.currentTracer().nextSpan().start();
-                                        countDownLatch.countDown();
-                                        countDownLatch.await();
-                                        try {
-                                            return null;
+                                        try (SpanInScope spanInScope =
+                                                     Tracing.currentTracer().withSpanInScope(span)) {
+                                            if (i == 1) {
+                                                countDownLatch.countDown();
+                                                countDownLatch.await();
+                                                // to wait second task get span.
+                                                Thread.sleep(1000L);
+                                            }
                                         } finally {
                                             span.finish();
                                         }
+                                        return null;
                                     }))).collect(toImmutableList()));
 
                     final CompletableFuture<HttpResponse> responseFuture = new CompletableFuture<>();
                     final HttpResponse res = HttpResponse.from(responseFuture);
                     transformAsync(spanAware,
                                    result -> allAsList(IntStream.range(1, 3).mapToObj(
-                                           i -> executorService.submit(() -> {
-                                               brave.Span span = Tracing.currentTracer().nextSpan().start();
-                                               try {
-                                                   return null;
-                                               } finally {
-                                                   span.finish();
-                                               }
-                                           })).collect(toImmutableList())),
-                                   RequestContext.current().eventLoop())
+                                           i -> executorService.submit(
+                                                   RequestContext.current().makeContextAware(() -> {
+                                                       ScopedSpan span = Tracing.currentTracer()
+                                                                                .startScopedSpan("aloha");
+                                                       try {
+                                                           return null;
+                                                       } finally {
+                                                           span.finish();
+                                                       }
+                                                   })
+                                           )).collect(toImmutableList())),
+                                   RequestContext.current().contextAwareExecutor())
                             .addListener(() -> {
                                 responseFuture.complete(HttpResponse.of(OK, MediaType.PLAIN_TEXT_UTF_8, "Lee"));
-                            }, RequestContext.current().eventLoop());
+                            }, RequestContext.current().contextAwareExecutor());
                     return res;
                 }
             }));
@@ -157,12 +174,10 @@ public class HttpTracingIntegrationTest {
     @Before
     public void setupClients() {
         fooClient = new ClientBuilder(server.uri(BINARY, "/foo"))
-                .decorator(HttpRequest.class, HttpResponse.class,
-                           HttpTracingClient.newDecorator(newTracing("client/foo")))
+                .decorator(HttpTracingClient.newDecorator(newTracing("client/foo")))
                 .build(HelloService.Iface.class);
         zipClient = new ClientBuilder(server.uri(BINARY, "/zip"))
-                .decorator(HttpRequest.class, HttpResponse.class,
-                        HttpTracingClient.newDecorator(newTracing("client/zip")))
+                .decorator(HttpTracingClient.newDecorator(newTracing("client/zip")))
                 .build(HelloService.Iface.class);
         fooClientWithoutTracing = Clients.newClient(server.uri(BINARY, "/foo"), HelloService.Iface.class);
         barClient = newClient("/bar");
@@ -186,14 +201,17 @@ public class HttpTracingIntegrationTest {
 
     private HelloService.AsyncIface newClient(String path) {
         return new ClientBuilder(server.uri(BINARY, path))
-                .decorator(HttpRequest.class, HttpResponse.class,
-                           HttpTracingClient.newDecorator(newTracing("client" + path)))
+                .decorator(HttpTracingClient.newDecorator(newTracing("client" + path)))
                 .build(HelloService.AsyncIface.class);
     }
 
     private static Tracing newTracing(String name) {
+        final CurrentTraceContext currentTraceContext =
+                RequestContextCurrentTraceContext.newBuilder()
+                                                 .addScopeDecorator(StrictScopeDecorator.create())
+                                                 .build();
         return Tracing.newBuilder()
-                      .currentTraceContext(CurrentTraceContext.Default.create())
+                      .currentTraceContext(currentTraceContext)
                       .localServiceName(name)
                       .spanReporter(spanReporter)
                       .sampler(Sampler.ALWAYS_SAMPLE)
@@ -254,6 +272,44 @@ public class HttpTracingIntegrationTest {
 
         // Check the span names.
         assertThat(spans).allMatch(s -> "hello".equals(s.name()));
+
+        // Check wire times
+        final long clientStartTime = clientFooSpan.timestampAsLong();
+        final long clientWireSendTime = clientFooSpan.annotations().stream()
+                                                     .filter(a -> a.value().equals("ws"))
+                                                     .findFirst().get().timestamp();
+        final long clientWireReceiveTime = clientFooSpan.annotations().stream()
+                                                        .filter(a -> a.value().equals("wr"))
+                                                        .findFirst().get().timestamp();
+        final long clientEndTime = clientStartTime + clientFooSpan.durationAsLong();
+
+        final long serverStartTime = serviceFooSpan.timestampAsLong();
+        final long serverWireSendTime = serviceFooSpan.annotations().stream()
+                                                      .filter(a -> a.value().equals("ws"))
+                                                      .findFirst().get().timestamp();
+        final long serverWireReceiveTime = serviceFooSpan.annotations().stream()
+                                                         .filter(a -> a.value().equals("wr"))
+                                                         .findFirst().get().timestamp();
+        final long serverEndTime = serverStartTime + serviceFooSpan.durationAsLong();
+
+        // These values are taken at microsecond precision and should be reliable to compare to each other.
+
+        // Because of the small deltas among these numbers in a unit test, a thread context switch can cause
+        // client - server values to not compare correctly. We go ahead and only verify values recorded from the
+        // same thread.
+
+        assertThat(clientStartTime).isNotZero();
+        assertThat(clientWireSendTime).isGreaterThanOrEqualTo(clientStartTime);
+        assertThat(clientWireReceiveTime).isGreaterThanOrEqualTo(clientWireSendTime);
+        assertThat(clientEndTime).isGreaterThanOrEqualTo(clientWireReceiveTime);
+
+        // Server start time and wire receive time are essentially the same in our current model, and whether
+        // one is greater than the other is mostly an implementation detail, so we don't compare them to each
+        // other.
+
+        assertThat(serverWireSendTime).isGreaterThanOrEqualTo(serverStartTime);
+        assertThat(serverWireSendTime).isGreaterThanOrEqualTo(serverWireReceiveTime);
+        assertThat(serverEndTime).isGreaterThanOrEqualTo(serverWireSendTime);
     }
 
     @Test(timeout = 10000)
@@ -302,7 +358,10 @@ public class HttpTracingIntegrationTest {
     public void testSpanInThreadPoolHasSameTraceId() throws Exception {
         poolHttpClient.get("pool").aggregate().get();
         final Span[] spans = spanReporter.take(5);
-        assertThat(Arrays.stream(spans).map(Span::traceId).collect(toImmutableSet())).hasSize(3);
+        assertThat(Arrays.stream(spans).map(Span::traceId).collect(toImmutableSet())).hasSize(1);
+        assertThat(Arrays.stream(spans).map(Span::parentId)
+                         .filter(Objects::nonNull)
+                         .collect(toImmutableSet())).hasSize(1);
     }
 
     private static Span findSpan(Span[] spans, String serviceName) {

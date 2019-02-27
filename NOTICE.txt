@@ -122,6 +122,11 @@ This product depends on Caffeine, distributed by Ben Manes:
   * License: licenses/LICENSE.caffeine.al20.txt (Apache License v2.0)
   * Homepage: https://github.com/ben-manes/caffeine
 
+This product depends on cglib, distributed by the cglib authors:
+
+  * License: licenses/LICENSE.cglib.al20.txt (Apache License v2.0)
+  * Homepage: https://github.com/cglib/cglib
+
 This product depends on completable-futures, distributed by Spotify AB:
 
   * License: license/LICENSE.completable-futures.al20.txt (Apache License v2.0)
@@ -221,6 +226,16 @@ This product depends on Netty, distributed by Netty.io:
 
   * License: licenses/LICENSE.netty.al20.txt (Apache License v2.0)
   * Homepage: https://netty.io/
+
+This product depends on OpenSAML, distributed by Shibboleth Project:
+
+  * License: licenses/LICENSE.opensaml.al20.txt (Apache License v2.0)
+  * Homepage: https://wiki.shibboleth.net/confluence/display/OS30/Home
+
+This product depends on Project Reactor, distributed by projectreactor.io:
+
+  * License: licenses/LICENSE.projectreactor.al20.txt (Apache License v2.0)
+  * Homepage: https://projectreactor.io/
 
 This product depends on protobuf-jackson, distributed by Choko:
 

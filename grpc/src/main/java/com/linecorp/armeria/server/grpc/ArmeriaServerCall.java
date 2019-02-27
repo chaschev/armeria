@@ -19,15 +19,16 @@ package com.linecorp.armeria.server.grpc;
 import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
-import static com.linecorp.armeria.common.util.Functions.voidFunction;
 import static io.netty.util.AsciiString.c2b;
 import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.HashMap;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import javax.annotation.Nullable;
@@ -39,6 +40,7 @@ import org.slf4j.LoggerFactory;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
+import com.google.common.util.concurrent.MoreExecutors;
 
 import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.HttpData;
@@ -48,15 +50,17 @@ import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
+import com.linecorp.armeria.common.grpc.ThrowableProto;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageFramer;
-import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 import com.linecorp.armeria.internal.grpc.GrpcMessageMarshaller;
+import com.linecorp.armeria.internal.grpc.GrpcStatus;
 import com.linecorp.armeria.internal.grpc.HttpStreamReader;
 import com.linecorp.armeria.internal.grpc.StatusMessageEscaper;
 import com.linecorp.armeria.internal.grpc.TransportStatusListener;
@@ -75,6 +79,7 @@ import io.grpc.MethodDescriptor;
 import io.grpc.MethodDescriptor.MethodType;
 import io.grpc.ServerCall;
 import io.grpc.Status;
+import io.grpc.StatusException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.util.AsciiString;
@@ -117,6 +122,8 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
     private final GrpcMessageMarshaller<I, O> marshaller;
     private final boolean unsafeWrapRequestBuffers;
     private final String advertisedEncodingsHeader;
+    @Nullable
+    private final Executor blockingExecutor;
 
     // Only set once.
     @Nullable
@@ -149,8 +156,9 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
                       int maxOutboundMessageSizeBytes,
                       ServiceRequestContext ctx,
                       SerializationFormat serializationFormat,
-                      MessageMarshaller jsonMarshaller,
+                      @Nullable MessageMarshaller jsonMarshaller,
                       boolean unsafeWrapRequestBuffers,
+                      boolean useBlockingTaskExecutor,
                       String advertisedEncodingsHeader) {
         requireNonNull(clientHeaders, "clientHeaders");
         this.method = requireNonNull(method, "method");
@@ -175,14 +183,19 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
                                                  unsafeWrapRequestBuffers);
         this.unsafeWrapRequestBuffers = unsafeWrapRequestBuffers;
         this.advertisedEncodingsHeader = advertisedEncodingsHeader;
+        blockingExecutor = useBlockingTaskExecutor ?
+                           MoreExecutors.newSequentialExecutor(ctx.blockingTaskExecutor()) : null;
 
-        res.completionFuture().handleAsync(voidFunction((unused, t) -> {
+        res.completionFuture().handleAsync((unused, t) -> {
             if (!closeCalled) {
                 // Closed by client, not by server.
                 cancelled = true;
-                close(Status.CANCELLED, EMPTY_METADATA);
+                try (SafeCloseable ignore = ctx.pushIfAbsent()) {
+                    close(Status.CANCELLED, EMPTY_METADATA);
+                }
             }
-        }), ctx.contextAwareEventLoop());
+            return null;
+        }, ctx.eventLoop());
     }
 
     @Override
@@ -256,10 +269,10 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
             res.write(messageFramer.writePayload(marshaller.serializeResponse(message)));
             res.onDemand(() -> {
                 if (pendingMessagesUpdater.decrementAndGet(this) == 0) {
-                    try {
-                        listener.onReady();
-                    } catch (Throwable t) {
-                        close(Status.fromThrowable(t), EMPTY_METADATA);
+                    if (blockingExecutor != null) {
+                        blockingExecutor.execute(this::invokeOnReady);
+                    } else {
+                        invokeOnReady();
                     }
                 }
             });
@@ -269,6 +282,14 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
         } catch (Throwable t) {
             close(Status.fromThrowable(t), EMPTY_METADATA);
             throw new RuntimeException(t);
+        }
+    }
+
+    private void invokeOnReady() {
+        try {
+            listener.onReady();
+        } catch (Throwable t) {
+            close(Status.fromThrowable(t), EMPTY_METADATA);
         }
     }
 
@@ -307,11 +328,17 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
             trailersObj = trailers;
         }
         try {
-            res.write(trailersObj);
-            res.close();
+            if (res.tryWrite(trailersObj)) {
+                res.close();
+            }
         } finally {
             closeListener(status);
         }
+    }
+
+    @VisibleForTesting
+    boolean isCloseCalled() {
+        return closeCalled;
     }
 
     @Override
@@ -377,6 +404,14 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
             GrpcUnsafeBufferUtil.storeBuffer(message.buf(), request, ctx);
         }
 
+        if (blockingExecutor != null) {
+            blockingExecutor.execute(() -> invokeOnMessage(request));
+        } else {
+            invokeOnMessage(request);
+        }
+    }
+
+    private void invokeOnMessage(I request) {
         try (SafeCloseable ignored = ctx.push()) {
             listener.onMessage(request);
         } catch (Throwable t) {
@@ -386,17 +421,25 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
 
     @Override
     public void endOfStream() {
-        clientStreamClosed = true;
+        setClientStreamClosed();
         if (!closeCalled) {
             if (!ctx.log().isAvailable(RequestLogAvailability.REQUEST_CONTENT)) {
                 ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method), null);
             }
 
-            try (SafeCloseable ignored = ctx.push()) {
-                listener.onHalfClose();
-            } catch (Throwable t) {
-                close(Status.fromThrowable(t), EMPTY_METADATA);
+            if (blockingExecutor != null) {
+                blockingExecutor.execute(this::invokeHalfClose);
+            } else {
+                invokeHalfClose();
             }
+        }
+    }
+
+    private void invokeHalfClose() {
+        try (SafeCloseable ignored = ctx.push()) {
+            listener.onHalfClose();
+        } catch (Throwable t) {
+            close(Status.fromThrowable(t), EMPTY_METADATA);
         }
     }
 
@@ -419,41 +462,71 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
     private void closeListener(Status newStatus) {
         if (!listenerClosed) {
             listenerClosed = true;
-            if (!clientStreamClosed) {
-                messageReader().cancel();
-                clientStreamClosed = true;
-            }
+            setClientStreamClosed();
             messageFramer.close();
             ctx.logBuilder().responseContent(GrpcLogUtil.rpcResponse(newStatus, firstResponse), null);
             if (newStatus.isOk()) {
-                try (SafeCloseable ignored = ctx.push()) {
-                    listener.onComplete();
-                } catch (Throwable t) {
-                    // This should not be possible with normal generated stubs which do not implement
-                    // onComplete, but is conceivable for a completely manually constructed stub.
-                    logger.warn("Error in gRPC onComplete handler.", t);
+                if (blockingExecutor != null) {
+                    blockingExecutor.execute(this::invokeOnComplete);
+                } else {
+                    invokeOnComplete();
                 }
             } else {
                 cancelled = true;
-                try (SafeCloseable ignored = ctx.push()) {
-                    listener.onCancel();
-                } catch (Throwable t) {
-                    if (!closeCalled) {
-                        // A custom error when dealing with client cancel or transport issues should be
-                        // returned. We have already closed the listener, so it will not receive any more
-                        // callbacks as designed.
-                        close(Status.fromThrowable(t), EMPTY_METADATA);
-                    }
+                if (blockingExecutor != null) {
+                    blockingExecutor.execute(this::invokeOnCancel);
+                } else {
+                    invokeOnCancel();
                 }
                 // Transport error, not business logic error, so reset the stream.
                 if (!closeCalled) {
-                    res.close(newStatus.asException());
+                    final StatusException statusException = newStatus.asException();
+                    final Throwable cause = statusException.getCause();
+                    if (cause != null) {
+                        res.close(cause);
+                    } else {
+                        res.abort();
+                    }
                 }
             }
         }
     }
 
-    static HttpHeaders statusToTrailers(Status status, boolean headersSent) {
+    private void invokeOnComplete() {
+        try (SafeCloseable ignored = ctx.push()) {
+            listener.onComplete();
+        } catch (Throwable t) {
+            // This should not be possible with normal generated stubs which do not implement
+            // onComplete, but is conceivable for a completely manually constructed stub.
+            logger.warn("Error in gRPC onComplete handler.", t);
+        }
+    }
+
+    private void invokeOnCancel() {
+        try (SafeCloseable ignored = ctx.push()) {
+            listener.onCancel();
+        } catch (Throwable t) {
+            if (!closeCalled) {
+                // A custom error when dealing with client cancel or transport issues should be
+                // returned. We have already closed the listener, so it will not receive any more
+                // callbacks as designed.
+                close(Status.fromThrowable(t), EMPTY_METADATA);
+            }
+        }
+    }
+
+    private void setClientStreamClosed() {
+        if (!clientStreamClosed) {
+            messageReader().cancel();
+            clientStreamClosed = true;
+        }
+    }
+
+    private HttpHeaders statusToTrailers(Status status, boolean headersSent) {
+        return statusToTrailers(ctx, status, headersSent);
+    }
+
+    static HttpHeaders statusToTrailers(ServiceRequestContext ctx, Status status, boolean headersSent) {
         final HttpHeaders trailers;
         if (headersSent) {
             // Normal trailers.
@@ -465,9 +538,14 @@ public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
                     .set(HttpHeaderNames.CONTENT_TYPE, "application/grpc+proto");
         }
         trailers.add(GrpcHeaderNames.GRPC_STATUS, Integer.toString(status.getCode().value()));
+
         if (status.getDescription() != null) {
-            trailers.add(GrpcHeaderNames.GRPC_MESSAGE,
-                         StatusMessageEscaper.escape(status.getDescription()));
+            trailers.add(GrpcHeaderNames.GRPC_MESSAGE, StatusMessageEscaper.escape(status.getDescription()));
+        }
+        if (ctx.server().config().verboseResponses() && status.getCause() != null) {
+            final ThrowableProto proto = GrpcStatus.serializeThrowable(status.getCause());
+            trailers.add(GrpcHeaderNames.ARMERIA_GRPC_THROWABLEPROTO_BIN,
+                         Base64.getEncoder().encodeToString(proto.toByteArray()));
         }
 
         return trailers;

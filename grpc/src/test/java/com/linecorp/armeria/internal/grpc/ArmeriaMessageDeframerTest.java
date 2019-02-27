@@ -110,9 +110,29 @@ public class ArmeriaMessageDeframerTest {
     }
 
     @Test
-    public void deframe_multipleFrames() throws Exception {
+    public void deframe_frameWithManyFragments() throws Exception {
         final byte[] frameBytes = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
         deframer.request(1);
+
+        // Only the last fragment should notify the listener.
+        for (int i = 0; i < frameBytes.length - 1; i++) {
+            deframer.deframe(HttpData.of(new byte[] { frameBytes[i] }), false);
+            verifyZeroInteractions(listener);
+            assertThat(deframer.isStalled()).isTrue();
+        }
+
+        deframer.deframe(HttpData.of(new byte[] { frameBytes[frameBytes.length - 1] }), false);
+        verifyAndReleaseMessage(new ByteBufOrStream(GrpcTestUtil.requestByteBuf()));
+        verifyNoMoreInteractions(listener);
+        assertThat(deframer.isStalled()).isTrue();
+    }
+
+    @Test
+    public void deframe_frameWithHeaderAndBodyFragment() throws Exception {
+        final byte[] frameBytes = GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf());
+        deframer.request(1);
+
+        // Frame is split into two fragments - header and body.
         deframer.deframe(HttpData.of(Arrays.copyOfRange(frameBytes, 0, 5)), false);
         verifyZeroInteractions(listener);
         assertThat(deframer.isStalled()).isTrue();
@@ -151,6 +171,7 @@ public class ArmeriaMessageDeframerTest {
     public void deframe_endOfStream() throws Exception {
         deframer.request(1);
         deframer.deframe(HttpData.EMPTY_DATA, true);
+        deframer.closeWhenComplete();
         verify(listener).endOfStream();
         verifyNoMoreInteractions(listener);
     }
@@ -175,8 +196,8 @@ public class ArmeriaMessageDeframerTest {
     public void deframe_tooLargeUncompressed() throws Exception {
         final SimpleRequest request = SimpleRequest.newBuilder()
                                                    .setPayload(Payload.newBuilder()
-                                                                .setBody(ByteString.copyFromUtf8(
-                                                                        Strings.repeat("a", 1024))))
+                                                                      .setBody(ByteString.copyFromUtf8(
+                                                                              Strings.repeat("a", 1024))))
                                                    .build();
         final byte[] frame = GrpcTestUtil.uncompressedFrame(Unpooled.wrappedBuffer(request.toByteArray()));
         assertThat(frame.length).isGreaterThan(1024);

@@ -16,8 +16,6 @@
 
 package com.linecorp.armeria.common;
 
-import com.linecorp.armeria.common.util.Exceptions;
-
 /**
  * A {@link RuntimeException} raised when the length of request or response content exceeds its limit.
  */
@@ -25,16 +23,19 @@ public final class ContentTooLargeException extends RuntimeException {
 
     private static final long serialVersionUID = 4901614315474105954L;
 
-    private static final ContentTooLargeException INSTANCE =
-            Exceptions.clearTrace(new ContentTooLargeException());
+    private static final ContentTooLargeException INSTANCE = new ContentTooLargeException(false);
 
     /**
      * Returns a {@link ContentTooLargeException} which may be a singleton or a new instance, depending on
-     * whether {@link Flags#verboseExceptions() the verbose exception mode} is enabled.
+     * whether {@linkplain Flags#verboseExceptions() the verbose exception mode} is enabled.
      */
     public static ContentTooLargeException get() {
         return Flags.verboseExceptions() ? new ContentTooLargeException() : INSTANCE;
     }
 
     private ContentTooLargeException() {}
+
+    private ContentTooLargeException(@SuppressWarnings("unused") boolean dummy) {
+        super(null, null, false, false);
+    }
 }

@@ -114,18 +114,18 @@ public class HttpClientIdleTimeoutHandlerTest {
         }
 
         @Override
-        public boolean isActive() {
+        public boolean canSendRequest() {
             return true;
         }
 
         @Override
         public InboundTrafficController inboundTrafficController() {
-            return HttpSession.INACTIVE.inboundTrafficController();
+            return InboundTrafficController.disabled();
         }
 
         @Override
-        public boolean hasUnfinishedResponses() {
-            return unfinishedResponses != 0;
+        public int unfinishedResponses() {
+            return unfinishedResponses;
         }
 
         @Override

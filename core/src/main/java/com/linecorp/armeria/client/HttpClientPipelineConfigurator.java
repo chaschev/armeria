@@ -47,8 +47,8 @@ import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.internal.ChannelUtil;
 import com.linecorp.armeria.internal.Http1ClientCodec;
-import com.linecorp.armeria.internal.Http2GoAwayListener;
 import com.linecorp.armeria.internal.ReadSuppressingHandler;
 import com.linecorp.armeria.internal.TrafficLoggingHandler;
 
@@ -178,6 +178,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
 
         // Configure the pipeline.
         final Channel ch = ctx.channel();
+        ChannelUtil.disableWriterBufferWatermark(ch);
 
         final ChannelPipeline p = ch.pipeline();
         p.addLast(new FlushConsolidationHandler());
@@ -251,9 +252,9 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
                     }
 
                     addBeforeSessionHandler(p, newHttp1Codec(
-                            clientFactory.maxHttp1InitialLineLength(),
-                            clientFactory.maxHttp1HeaderSize(),
-                            clientFactory.maxHttp1ChunkSize()));
+                            clientFactory.http1MaxInitialLineLength(),
+                            clientFactory.http1MaxHeaderSize(),
+                            clientFactory.http1MaxChunkSize()));
                     protocol = H1;
                 }
                 finishSuccessfully(p, protocol);
@@ -318,9 +319,9 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
                 pipeline.addLast(http2Handler);
             } else {
                 final Http1ClientCodec http1Codec = newHttp1Codec(
-                        clientFactory.maxHttp1InitialLineLength(),
-                        clientFactory.maxHttp1HeaderSize(),
-                        clientFactory.maxHttp1ChunkSize());
+                        clientFactory.http1MaxInitialLineLength(),
+                        clientFactory.http1MaxHeaderSize(),
+                        clientFactory.http1MaxChunkSize());
                 final Http2ClientUpgradeCodec http2ClientUpgradeCodec =
                         new Http2ClientUpgradeCodec(http2Handler);
                 final HttpClientUpgradeHandler http2UpgradeHandler =
@@ -335,9 +336,9 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
             }
         } else {
             pipeline.addLast(newHttp1Codec(
-                    clientFactory.maxHttp1InitialLineLength(),
-                    clientFactory.maxHttp1HeaderSize(),
-                    clientFactory.maxHttp1ChunkSize()));
+                    clientFactory.http1MaxInitialLineLength(),
+                    clientFactory.http1MaxHeaderSize(),
+                    clientFactory.http1MaxChunkSize()));
 
             // NB: We do not call finishSuccessfully() immediately here
             //     because it assumes HttpSessionHandler to be in the pipeline,
@@ -359,7 +360,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
         if (protocol == H1 || protocol == H1C) {
             addBeforeSessionHandler(pipeline, new Http1ResponseDecoder(pipeline.channel()));
         } else if (protocol == H2 || protocol == H2C) {
-            final int initialWindow = clientFactory.initialHttp2ConnectionWindowSize();
+            final int initialWindow = clientFactory.http2InitialConnectionWindowSize();
             if (initialWindow > DEFAULT_WINDOW_SIZE) {
                 incrementLocalWindowSize(pipeline, initialWindow - DEFAULT_WINDOW_SIZE);
             }
@@ -470,7 +471,7 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
 
                 @Override
                 public void onComplete() {}
-            });
+            }, ctx.channel().eventLoop());
 
             // NB: No need to set the response timeout because we have session creation timeout.
             responseDecoder.addResponse(0, null, res, RequestLogBuilder.NOOP, 0, UPGRADE_RESPONSE_MAX_LENGTH);
@@ -632,34 +633,27 @@ final class HttpClientPipelineConfigurator extends ChannelDuplexHandler {
     private Http2ClientConnectionHandler newHttp2ConnectionHandler(Channel ch) {
         final boolean validateHeaders = false;
         final Http2Connection conn = new DefaultHttp2Connection(false);
-        conn.addListener(new Http2GoAwayListener(ch));
-
         final Http2FrameReader reader = new DefaultHttp2FrameReader(validateHeaders);
         final Http2FrameWriter writer = new DefaultHttp2FrameWriter();
 
         final Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(conn, writer);
         final Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(conn, encoder, reader);
 
-        final Http2Settings http2Settings = http2Settings();
-
-        final Http2ResponseDecoder listener = new Http2ResponseDecoder(conn, ch, encoder);
-        final Http2ClientConnectionHandler handler =
-                new Http2ClientConnectionHandler(decoder, encoder, http2Settings, listener);
-        // Setup post build options
-        handler.gracefulShutdownTimeoutMillis(clientFactory.idleTimeoutMillis());
-
-        return handler;
+        return new Http2ClientConnectionHandler(decoder, encoder, http2Settings(), ch, clientFactory);
     }
 
     private Http2Settings http2Settings() {
-        final Http2Settings http2Settings = new Http2Settings();
-        if (clientFactory.initialHttp2StreamWindowSize() != DEFAULT_WINDOW_SIZE) {
-            http2Settings.initialWindowSize(clientFactory.initialHttp2StreamWindowSize());
+        final Http2Settings settings = new Http2Settings();
+        final int initialWindowSize = clientFactory.http2InitialStreamWindowSize();
+        if (initialWindowSize != DEFAULT_WINDOW_SIZE) {
+            settings.initialWindowSize(initialWindowSize);
         }
-        if (clientFactory.http2MaxFrameSize() != DEFAULT_MAX_FRAME_SIZE) {
-            http2Settings.maxFrameSize(clientFactory.http2MaxFrameSize());
+        final int maxFrameSize = clientFactory.http2MaxFrameSize();
+        if (maxFrameSize != DEFAULT_MAX_FRAME_SIZE) {
+            settings.maxFrameSize(maxFrameSize);
         }
-        return http2Settings;
+        settings.maxHeaderListSize(clientFactory.http2MaxHeaderListSize());
+        return settings;
     }
 
     private static Http1ClientCodec newHttp1Codec(

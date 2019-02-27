@@ -29,15 +29,10 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 import com.google.common.collect.MapMaker;
 
-import com.linecorp.armeria.client.pool.DefaultKeyedChannelPool;
-import com.linecorp.armeria.client.pool.KeyedChannelPool;
-import com.linecorp.armeria.client.pool.KeyedChannelPoolHandler;
-import com.linecorp.armeria.client.pool.PoolKey;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.RequestContext;
@@ -49,14 +44,12 @@ import com.linecorp.armeria.internal.TransportType;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFactory;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.resolver.AddressResolverGroup;
-import io.netty.util.concurrent.Future;
 
 /**
  * A {@link ClientFactory} that creates an HTTP client.
@@ -68,32 +61,31 @@ final class HttpClientFactory extends AbstractClientFactory {
                   .map(p -> Scheme.of(SerializationFormat.NONE, p))
                   .collect(toImmutableSet());
 
-    private static final Predicate<Channel> POOL_HEALTH_CHECKER =
-            ch -> ch.isActive() && HttpSession.get(ch).isActive();
-
     private final EventLoopGroup workerGroup;
     private final boolean shutdownWorkerGroupOnClose;
     private final Bootstrap baseBootstrap;
     private final Consumer<? super SslContextBuilder> sslContextCustomizer;
-    private final int initialHttp2ConnectionWindowSize;
-    private final int initialHttp2StreamWindowSize;
+    private final int http2InitialConnectionWindowSize;
+    private final int http2InitialStreamWindowSize;
     private final int http2MaxFrameSize;
-    private final int maxHttp1InitialLineLength;
-    private final int maxHttp1HeaderSize;
-    private final int maxHttp1ChunkSize;
+    private final long http2MaxHeaderListSize;
+    private final int http1MaxInitialLineLength;
+    private final int http1MaxHeaderSize;
+    private final int http1MaxChunkSize;
     private final long idleTimeoutMillis;
     private final boolean useHttp2Preface;
     private final boolean useHttp1Pipelining;
-    private final ConnectionPoolListenerImpl connectionPoolListener;
+    private final ConnectionPoolListener connectionPoolListener;
     private MeterRegistry meterRegistry;
 
-    private final ConcurrentMap<EventLoop, KeyedChannelPool<PoolKey>> pools = new MapMaker().weakKeys()
-                                                                                            .makeMap();
+    private final ConcurrentMap<EventLoop, HttpChannelPool> pools = new MapMaker().weakKeys().makeMap();
     private final HttpClientDelegate clientDelegate;
 
     private final EventLoopScheduler eventLoopScheduler;
     private final Supplier<EventLoop> eventLoopSupplier =
             () -> RequestContext.mapCurrent(RequestContext::eventLoop, () -> eventLoopGroup().next());
+
+    private volatile boolean closed;
 
     HttpClientFactory(
             EventLoopGroup workerGroup, boolean shutdownWorkerGroupOnClose,
@@ -101,10 +93,10 @@ final class HttpClientFactory extends AbstractClientFactory {
             Consumer<? super SslContextBuilder> sslContextCustomizer,
             Function<? super EventLoopGroup,
                     ? extends AddressResolverGroup<? extends InetSocketAddress>> addressResolverGroupFactory,
-            int initialHttp2ConnectionWindowSize, int initialHttp2StreamWindowSize, int http2MaxFrameSize,
-            int maxHttp1InitialLineLength, int maxHttp1HeaderSize, int maxHttp1ChunkSize,
-            long idleTimeoutMillis, boolean useHttp2Preface, boolean useHttp1Pipelining,
-            KeyedChannelPoolHandler<? super PoolKey> connectionPoolListener, MeterRegistry meterRegistry) {
+            int http2InitialConnectionWindowSize, int http2InitialStreamWindowSize, int http2MaxFrameSize,
+            long http2MaxHeaderListSize, int http1MaxInitialLineLength, int http1MaxHeaderSize,
+            int http1MaxChunkSize, long idleTimeoutMillis, boolean useHttp2Preface, boolean useHttp1Pipelining,
+            ConnectionPoolListener connectionPoolListener, MeterRegistry meterRegistry) {
 
         @SuppressWarnings("unchecked")
         final AddressResolverGroup<InetSocketAddress> addressResolverGroup =
@@ -124,16 +116,17 @@ final class HttpClientFactory extends AbstractClientFactory {
         this.shutdownWorkerGroupOnClose = shutdownWorkerGroupOnClose;
         this.baseBootstrap = baseBootstrap;
         this.sslContextCustomizer = sslContextCustomizer;
-        this.initialHttp2ConnectionWindowSize = initialHttp2ConnectionWindowSize;
-        this.initialHttp2StreamWindowSize = initialHttp2StreamWindowSize;
+        this.http2InitialConnectionWindowSize = http2InitialConnectionWindowSize;
+        this.http2InitialStreamWindowSize = http2InitialStreamWindowSize;
         this.http2MaxFrameSize = http2MaxFrameSize;
-        this.maxHttp1InitialLineLength = maxHttp1InitialLineLength;
-        this.maxHttp1HeaderSize = maxHttp1HeaderSize;
-        this.maxHttp1ChunkSize = maxHttp1ChunkSize;
+        this.http2MaxHeaderListSize = http2MaxHeaderListSize;
+        this.http1MaxInitialLineLength = http1MaxInitialLineLength;
+        this.http1MaxHeaderSize = http1MaxHeaderSize;
+        this.http1MaxChunkSize = http1MaxChunkSize;
         this.idleTimeoutMillis = idleTimeoutMillis;
         this.useHttp2Preface = useHttp2Preface;
         this.useHttp1Pipelining = useHttp1Pipelining;
-        this.connectionPoolListener = new ConnectionPoolListenerImpl(connectionPoolListener);
+        this.connectionPoolListener = connectionPoolListener;
         this.meterRegistry = meterRegistry;
 
         clientDelegate = new HttpClientDelegate(this, addressResolverGroup);
@@ -152,28 +145,32 @@ final class HttpClientFactory extends AbstractClientFactory {
         return sslContextCustomizer;
     }
 
-    int initialHttp2ConnectionWindowSize() {
-        return initialHttp2ConnectionWindowSize;
+    int http2InitialConnectionWindowSize() {
+        return http2InitialConnectionWindowSize;
     }
 
-    int initialHttp2StreamWindowSize() {
-        return initialHttp2StreamWindowSize;
+    int http2InitialStreamWindowSize() {
+        return http2InitialStreamWindowSize;
     }
 
     int http2MaxFrameSize() {
         return http2MaxFrameSize;
     }
 
-    int maxHttp1InitialLineLength() {
-        return maxHttp1InitialLineLength;
+    long http2MaxHeaderListSize() {
+        return http2MaxHeaderListSize;
     }
 
-    int maxHttp1HeaderSize() {
-        return maxHttp1HeaderSize;
+    int http1MaxInitialLineLength() {
+        return http1MaxInitialLineLength;
     }
 
-    int maxHttp1ChunkSize() {
-        return maxHttp1ChunkSize;
+    int http1MaxHeaderSize() {
+        return http1MaxHeaderSize;
+    }
+
+    int http1MaxChunkSize() {
+        return http1MaxChunkSize;
     }
 
     long idleTimeoutMillis() {
@@ -188,7 +185,7 @@ final class HttpClientFactory extends AbstractClientFactory {
         return useHttp1Pipelining;
     }
 
-    KeyedChannelPoolHandler<? super PoolKey> connectionPoolListener() {
+    ConnectionPoolListener connectionPoolListener() {
         return connectionPoolListener;
     }
 
@@ -271,11 +268,15 @@ final class HttpClientFactory extends AbstractClientFactory {
         }
     }
 
+    boolean isClosing() {
+        return closed;
+    }
+
     @Override
     public void close() {
-        connectionPoolListener.setClosed();
+        closed = true;
 
-        for (final Iterator<KeyedChannelPool<PoolKey>> i = pools.values().iterator(); i.hasNext();) {
+        for (final Iterator<HttpChannelPool> i = pools.values().iterator(); i.hasNext();) {
             i.next().close();
             i.remove();
         }
@@ -285,61 +286,13 @@ final class HttpClientFactory extends AbstractClientFactory {
         }
     }
 
-    KeyedChannelPool<PoolKey> pool(EventLoop eventLoop) {
-        final KeyedChannelPool<PoolKey> pool = pools.get(eventLoop);
+    HttpChannelPool pool(EventLoop eventLoop) {
+        final HttpChannelPool pool = pools.get(eventLoop);
         if (pool != null) {
             return pool;
         }
 
-        return pools.computeIfAbsent(eventLoop, e -> {
-            final Function<PoolKey, Future<Channel>> channelFactory =
-                    new HttpSessionChannelFactory(this, eventLoop);
-
-            @SuppressWarnings("unchecked")
-            final KeyedChannelPoolHandler<PoolKey> handler =
-                    (KeyedChannelPoolHandler<PoolKey>) connectionPoolListener();
-
-            return new DefaultKeyedChannelPool<>(
-                    eventLoop, channelFactory, POOL_HEALTH_CHECKER, handler, true);
-        });
-    }
-
-    private static final class ConnectionPoolListenerImpl implements KeyedChannelPoolHandler<PoolKey> {
-
-        private final KeyedChannelPoolHandler<? super PoolKey> connectionPoolListener;
-        private volatile boolean closed;
-
-        ConnectionPoolListenerImpl(KeyedChannelPoolHandler<? super PoolKey> connectionPoolListener) {
-            this.connectionPoolListener = connectionPoolListener;
-        }
-
-        @Override
-        public void channelCreated(PoolKey key, Channel ch) throws Exception {
-            if (closed) {
-                ch.close();
-                return;
-            }
-
-            connectionPoolListener.channelCreated(key, ch);
-        }
-
-        @Override
-        public void channelAcquired(PoolKey key, Channel ch) throws Exception {
-            connectionPoolListener.channelAcquired(key, ch);
-        }
-
-        @Override
-        public void channelReleased(PoolKey key, Channel ch) throws Exception {
-            connectionPoolListener.channelReleased(key, ch);
-        }
-
-        @Override
-        public void channelClosed(PoolKey key, Channel ch) throws Exception {
-            connectionPoolListener.channelClosed(key, ch);
-        }
-
-        void setClosed() {
-            closed = true;
-        }
+        return pools.computeIfAbsent(eventLoop,
+                                     e -> new HttpChannelPool(this, eventLoop, connectionPoolListener()));
     }
 }

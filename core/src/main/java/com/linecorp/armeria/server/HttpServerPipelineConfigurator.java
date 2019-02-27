@@ -21,6 +21,7 @@ import static com.linecorp.armeria.common.SessionProtocol.HTTPS;
 import static com.linecorp.armeria.common.SessionProtocol.PROXY;
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.EnumSet;
 import java.util.Iterator;
@@ -37,8 +38,8 @@ import com.google.common.collect.Iterables;
 
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.internal.ChannelUtil;
 import com.linecorp.armeria.internal.Http1ObjectEncoder;
-import com.linecorp.armeria.internal.Http2GoAwayListener;
 import com.linecorp.armeria.internal.ReadSuppressingHandler;
 import com.linecorp.armeria.internal.TrafficLoggingHandler;
 
@@ -78,6 +79,7 @@ import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
 import io.netty.util.AsciiString;
 import io.netty.util.DomainNameMapping;
+import io.netty.util.NetUtil;
 
 /**
  * Configures Netty {@link ChannelPipeline} to serve HTTP/1 and 2 requests.
@@ -88,8 +90,8 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
 
     private static final int SSL_RECORD_HEADER_LENGTH = 5;
 
-    private static final AsciiString SCHEME_HTTP = AsciiString.of("http");
-    private static final AsciiString SCHEME_HTTPS = AsciiString.of("https");
+    private static final AsciiString SCHEME_HTTP = AsciiString.cached("http");
+    private static final AsciiString SCHEME_HTTPS = AsciiString.cached("https");
 
     private static final int UPGRADE_REQUEST_MAX_LENGTH = 16384;
 
@@ -124,6 +126,8 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
 
     @Override
     protected void initChannel(Channel ch) throws Exception {
+        ChannelUtil.disableWriterBufferWatermark(ch);
+
         final ChannelPipeline p = ch.pipeline();
         p.addLast(new FlushConsolidationHandler());
         p.addLast(ReadSuppressingHandler.INSTANCE);
@@ -152,7 +156,7 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
     }
 
     private void configureHttp(ChannelPipeline p, @Nullable ProxiedAddresses proxiedAddresses) {
-        final Http1ObjectEncoder responseEncoder = new Http1ObjectEncoder(true, false);
+        final Http1ObjectEncoder responseEncoder = new Http1ObjectEncoder(p.channel(), true, false);
         p.addLast(TrafficLoggingHandler.SERVER);
         p.addLast(new Http2PrefaceOrHttpHandler(responseEncoder));
         configureIdleTimeoutHandler(p);
@@ -176,26 +180,33 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
     private Http2ConnectionHandler newHttp2ConnectionHandler(ChannelPipeline pipeline) {
 
         final Http2Connection conn = new DefaultHttp2Connection(true);
-        conn.addListener(new Http2GoAwayListener(pipeline.channel()));
-
         final Http2FrameReader reader = new DefaultHttp2FrameReader(true);
         final Http2FrameWriter writer = new DefaultHttp2FrameWriter();
 
         final Http2ConnectionEncoder encoder = new DefaultHttp2ConnectionEncoder(conn, writer);
         final Http2ConnectionDecoder decoder = new DefaultHttp2ConnectionDecoder(conn, encoder, reader);
 
-        final Http2ConnectionHandler handler =
-                new Http2ServerConnectionHandler(decoder, encoder, new Http2Settings());
+        return new Http2ServerConnectionHandler(
+                decoder, encoder, http2Settings(), pipeline.channel(), config, gracefulShutdownSupport);
+    }
 
-        // Setup post build options
-        final Http2RequestDecoder listener =
-                new Http2RequestDecoder(config, pipeline.channel(), handler.encoder());
+    private Http2Settings http2Settings() {
+        final Http2Settings settings = new Http2Settings();
+        final int initialWindowSize = config.http2InitialStreamWindowSize();
+        if (initialWindowSize != Http2CodecUtil.DEFAULT_WINDOW_SIZE) {
+            settings.initialWindowSize(initialWindowSize);
+        }
 
-        handler.connection().addListener(listener);
-        handler.decoder().frameListener(listener);
-        handler.gracefulShutdownTimeoutMillis(config.idleTimeoutMillis());
+        final int maxFrameSize = config.http2MaxFrameSize();
+        if (maxFrameSize != Http2CodecUtil.DEFAULT_MAX_FRAME_SIZE) {
+            settings.maxFrameSize(maxFrameSize);
+        }
 
-        return handler;
+        // Not using the value greater than 2^31-1 because some HTTP/2 client implementations use a signed
+        // 32-bit integer to represent an HTTP/2 SETTINGS parameter value.
+        settings.maxConcurrentStreams(Math.min(config.http2MaxStreamsPerConnection(), Integer.MAX_VALUE));
+        settings.maxHeaderListSize(config.http2MaxHeaderListSize());
+        return settings;
     }
 
     private final class ProtocolDetectionHandler extends ByteToMessageDecoder {
@@ -326,9 +337,13 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
                              proxiedCandidates);
             }
             final ChannelPipeline p = ctx.pipeline();
-            final ProxiedAddresses proxiedAddresses = ProxiedAddresses.of(
-                    InetSocketAddress.createUnresolved(msg.sourceAddress(), msg.sourcePort()),
-                    InetSocketAddress.createUnresolved(msg.destinationAddress(), msg.destinationPort()));
+            final InetAddress src = InetAddress.getByAddress(
+                    NetUtil.createByteArrayFromIpAddressString(msg.sourceAddress()));
+            final InetAddress dst = InetAddress.getByAddress(
+                    NetUtil.createByteArrayFromIpAddressString(msg.destinationAddress()));
+            final ProxiedAddresses proxiedAddresses =
+                    ProxiedAddresses.of(new InetSocketAddress(src, msg.sourcePort()),
+                                        new InetSocketAddress(dst, msg.destinationPort()));
             configurePipeline(p, proxiedCandidates, proxiedAddresses);
             p.remove(this);
         }
@@ -368,13 +383,14 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
         }
 
         private void addHttpHandlers(ChannelHandlerContext ctx) {
+            final Channel ch = ctx.channel();
             final ChannelPipeline p = ctx.pipeline();
-            final Http1ObjectEncoder writer = new Http1ObjectEncoder(true, true);
+            final Http1ObjectEncoder writer = new Http1ObjectEncoder(ch, true, true);
             p.addLast(new HttpServerCodec(
-                    config.defaultMaxHttp1InitialLineLength(),
-                    config.defaultMaxHttp1HeaderSize(),
-                    config.defaultMaxHttp1ChunkSize()));
-            p.addLast(new Http1RequestDecoder(config, ctx.channel(), SCHEME_HTTPS, writer));
+                    config.http1MaxInitialLineLength(),
+                    config.http1MaxHeaderSize(),
+                    config.http1MaxChunkSize()));
+            p.addLast(new Http1RequestDecoder(config, ch, SCHEME_HTTPS, writer));
             configureIdleTimeoutHandler(p);
             p.addLast(new HttpServerHandler(config, gracefulShutdownSupport, writer,
                                             SessionProtocol.H1, proxiedAddresses));
@@ -382,7 +398,9 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
 
         @Override
         protected void handshakeFailure(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-            logger.warn("{} TLS handshake failed:", ctx.channel(), cause);
+            if (!Exceptions.isExpected(cause)) {
+                logger.warn("{} TLS handshake failed:", ctx.channel(), cause);
+            }
             ctx.close();
 
             // On handshake failure, ApplicationProtocolNegotiationHandler will remove itself,
@@ -444,9 +462,9 @@ final class HttpServerPipelineConfigurator extends ChannelInitializer<Channel> {
         private void configureHttp1WithUpgrade(ChannelHandlerContext ctx) {
             final ChannelPipeline p = ctx.pipeline();
             final HttpServerCodec http1codec = new HttpServerCodec(
-                    config.defaultMaxHttp1InitialLineLength(),
-                    config.defaultMaxHttp1HeaderSize(),
-                    config.defaultMaxHttp1ChunkSize());
+                    config.http1MaxInitialLineLength(),
+                    config.http1MaxHeaderSize(),
+                    config.http1MaxChunkSize());
 
             String baseName = name;
             assert baseName != null;

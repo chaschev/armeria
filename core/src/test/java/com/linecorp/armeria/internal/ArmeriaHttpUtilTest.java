@@ -17,11 +17,17 @@
 package com.linecorp.armeria.internal;
 
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.concatPaths;
+import static com.linecorp.armeria.internal.ArmeriaHttpUtil.decodePath;
+import static com.linecorp.armeria.internal.ArmeriaHttpUtil.parseCacheControl;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.setHttp2Authority;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.toArmeria;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.toNettyHttp1;
 import static com.linecorp.armeria.internal.ArmeriaHttpUtil.toNettyHttp2;
 import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.function.BiConsumer;
 
 import org.junit.Test;
 
@@ -35,7 +41,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http2.DefaultHttp2Headers;
 import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Headers;
-import io.netty.util.AsciiString;
+import io.netty.handler.codec.http2.HttpConversionUtil.ExtensionHeaderNames;
 
 public class ArmeriaHttpUtilTest {
     @Test
@@ -52,6 +58,77 @@ public class ArmeriaHttpUtilTest {
         assertThat(concatPaths("/a", "b")).isEqualTo("/a/b");
         assertThat(concatPaths("/a", "/b")).isEqualTo("/a/b");
         assertThat(concatPaths("/a/", "/b")).isEqualTo("/a/b");
+    }
+
+    @Test
+    public void testDecodePath() throws Exception {
+        // Fast path
+        final String pathThatDoesNotNeedDecode = "/foo_bar_baz";
+        assertThat(decodePath(pathThatDoesNotNeedDecode)).isSameAs(pathThatDoesNotNeedDecode);
+
+        // Slow path
+        assertThat(decodePath("/foo%20bar\u007fbaz")).isEqualTo("/foo bar\u007fbaz");
+        assertThat(decodePath("/%C2%A2")).isEqualTo("/¢"); // Valid UTF-8 sequence
+        assertThat(decodePath("/%20\u0080")).isEqualTo("/ �"); // Unallowed character
+        assertThat(decodePath("/%")).isEqualTo("/�"); // No digit
+        assertThat(decodePath("/%1")).isEqualTo("/�"); // Only a single digit
+        assertThat(decodePath("/%G0")).isEqualTo("/�"); // First digit is not hex.
+        assertThat(decodePath("/%0G")).isEqualTo("/�"); // Second digit is not hex.
+        assertThat(decodePath("/%C3%28")).isEqualTo("/�("); // Invalid UTF-8 sequence
+    }
+
+    @Test
+    public void testParseCacheControl() {
+        final Map<String, String> values = new LinkedHashMap<>();
+        final BiConsumer<String, String> cb = (name, value) -> assertThat(values.put(name, value)).isNull();
+
+        // Make sure an effectively empty string does not invoke a callback.
+        parseCacheControl("", cb);
+        assertThat(values).isEmpty();
+        parseCacheControl(" \t ", cb);
+        assertThat(values).isEmpty();
+        parseCacheControl(" ,,=, =,= ,", cb);
+        assertThat(values).isEmpty();
+
+        // Name only.
+        parseCacheControl("no-cache", cb);
+        assertThat(values).hasSize(1).containsEntry("no-cache", null);
+        values.clear();
+        parseCacheControl(" no-cache ", cb);
+        assertThat(values).hasSize(1).containsEntry("no-cache", null);
+        values.clear();
+        parseCacheControl("no-cache ,", cb);
+        assertThat(values).hasSize(1).containsEntry("no-cache", null);
+        values.clear();
+
+        // Name and value.
+        parseCacheControl("max-age=86400", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+        parseCacheControl(" max-age = 86400 ", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+        parseCacheControl(" max-age = 86400 ,", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+        parseCacheControl("max-age=\"86400\"", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+        parseCacheControl(" max-age = \"86400\" ", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+        parseCacheControl(" max-age = \"86400\" ,", cb);
+        assertThat(values).hasSize(1).containsEntry("max-age", "86400");
+        values.clear();
+
+        // Multiple names and values.
+        parseCacheControl("a,b=c,d,e=\"f\",g", cb);
+        assertThat(values).hasSize(5)
+                          .containsEntry("a", null)
+                          .containsEntry("b", "c")
+                          .containsEntry("d",null)
+                          .containsEntry("e", "f")
+                          .containsEntry("g", null);
     }
 
     @Test
@@ -82,7 +159,7 @@ public class ArmeriaHttpUtilTest {
         in.add(HttpHeaderNames.COOKIE, "i=j");
         in.add(HttpHeaderNames.COOKIE, "k=l;");
 
-        final Http2Headers out = toNettyHttp2(in);
+        final Http2Headers out = toNettyHttp2(in, true);
         assertThat(out.getAll(HttpHeaderNames.COOKIE))
                 .containsExactly("a=b", "c=d", "e=f", "g=h", "i=j", "k=l");
     }
@@ -105,6 +182,16 @@ public class ArmeriaHttpUtilTest {
     }
 
     @Test
+    public void endOfStreamSet() {
+        final Http2Headers in = new DefaultHttp2Headers();
+        final HttpHeaders out = toArmeria(in, true);
+        assertThat(out.isEndOfStream()).isTrue();
+
+        final HttpHeaders out2 = toArmeria(in, false);
+        assertThat(out2.isEndOfStream()).isFalse();
+    }
+
+    @Test
     public void inboundCookiesMustBeMergedForHttp2() {
         final Http2Headers in = new DefaultHttp2Headers();
 
@@ -114,7 +201,7 @@ public class ArmeriaHttpUtilTest {
         in.add(HttpHeaderNames.COOKIE, "i=j");
         in.add(HttpHeaderNames.COOKIE, "k=l;");
 
-        final HttpHeaders out = toArmeria(in);
+        final HttpHeaders out = toArmeria(in, false);
 
         assertThat(out.getAll(HttpHeaderNames.COOKIE))
                 .containsExactly("a=b; c=d; e=f; g=h; i=j; k=l");
@@ -230,6 +317,68 @@ public class ArmeriaHttpUtilTest {
         final HttpHeaders out = new DefaultHttpHeaders();
         toArmeria(in, out);
         assertThat(out).hasSize(1);
-        assertThat(out.get(AsciiString.of("hello"))).isEqualTo("world");
+        assertThat(out.get(HttpHeaderNames.of("hello"))).isEqualTo("world");
+    }
+
+    @Test
+    public void excludeBlacklistHeadersWhileHttp2ToHttp1() throws Http2Exception {
+        final HttpHeaders in = new DefaultHttpHeaders();
+
+        in.add(HttpHeaderNames.TRAILER, "foo");
+        in.add(HttpHeaderNames.AUTHORITY, "bar"); // Translated to host
+        in.add(HttpHeaderNames.PATH, "dummy");
+        in.add(HttpHeaderNames.METHOD, "dummy");
+        in.add(HttpHeaderNames.SCHEME, "dummy");
+        in.add(HttpHeaderNames.STATUS, "dummy");
+        in.add(HttpHeaderNames.TRANSFER_ENCODING, "dummy");
+        in.add(ExtensionHeaderNames.STREAM_ID.text(), "dummy");
+        in.add(ExtensionHeaderNames.SCHEME.text(), "dummy");
+        in.add(ExtensionHeaderNames.PATH.text(), "dummy");
+
+        final io.netty.handler.codec.http.HttpHeaders out =
+                new io.netty.handler.codec.http.DefaultHttpHeaders();
+
+        toNettyHttp1(0, in, out, HttpVersion.HTTP_1_1, false, false);
+        assertThat(out).isEqualTo(new io.netty.handler.codec.http.DefaultHttpHeaders()
+                                          .add(io.netty.handler.codec.http.HttpHeaderNames.TRAILER, "foo")
+                                          .add(io.netty.handler.codec.http.HttpHeaderNames.HOST, "bar"));
+    }
+
+    @Test
+    public void excludeBlacklistInTrailingHeaders() throws Http2Exception {
+        final HttpHeaders in = new DefaultHttpHeaders();
+
+        in.add(HttpHeaderNames.of("foo"), "bar");
+        in.add(HttpHeaderNames.TRANSFER_ENCODING, "dummy");
+        in.add(HttpHeaderNames.CONTENT_LENGTH, "dummy");
+        in.add(HttpHeaderNames.CACHE_CONTROL, "dummy");
+        in.add(HttpHeaderNames.EXPECT, "dummy");
+        in.add(HttpHeaderNames.HOST, "dummy");
+        in.add(HttpHeaderNames.MAX_FORWARDS, "dummy");
+        in.add(HttpHeaderNames.PRAGMA, "dummy");
+        in.add(HttpHeaderNames.RANGE, "dummy");
+        in.add(HttpHeaderNames.TE, "dummy");
+        in.add(HttpHeaderNames.WWW_AUTHENTICATE, "dummy");
+        in.add(HttpHeaderNames.AUTHORIZATION, "dummy");
+        in.add(HttpHeaderNames.PROXY_AUTHENTICATE, "dummy");
+        in.add(HttpHeaderNames.PROXY_AUTHORIZATION, "dummy");
+        in.add(HttpHeaderNames.DATE, "dummy");
+        in.add(HttpHeaderNames.LOCATION, "dummy");
+        in.add(HttpHeaderNames.RETRY_AFTER, "dummy");
+        in.add(HttpHeaderNames.VARY, "dummy");
+        in.add(HttpHeaderNames.WARNING, "dummy");
+        in.add(HttpHeaderNames.CONTENT_ENCODING, "dummy");
+        in.add(HttpHeaderNames.CONTENT_TYPE, "dummy");
+        in.add(HttpHeaderNames.CONTENT_RANGE, "dummy");
+        in.add(HttpHeaderNames.TRAILER, "dummy");
+
+        final io.netty.handler.codec.http.HttpHeaders outHttp1 =
+                new io.netty.handler.codec.http.DefaultHttpHeaders();
+
+        toNettyHttp1(0, in, outHttp1, HttpVersion.HTTP_1_1, true, false);
+        assertThat(outHttp1).isEqualTo(new io.netty.handler.codec.http.DefaultHttpHeaders().add("foo", "bar"));
+
+        final Http2Headers outHttp2 = toNettyHttp2(in, true);
+        assertThat(outHttp2).isEqualTo(new DefaultHttp2Headers().add("foo", "bar"));
     }
 }

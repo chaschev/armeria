@@ -125,6 +125,7 @@ you build a :api:`GrpcService`:
 
 .. code-block:: java
 
+    import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
     import com.linecorp.armeria.server.cors.CorsServiceBuilder;
 
     ServerBuilder sb = new ServerBuilder();
@@ -135,7 +136,11 @@ you build a :api:`GrpcService`:
                               .allowRequestMethods(HttpMethod.POST) // Allow POST method.
                               // Allow Content-type and X-GRPC-WEB headers.
                               .allowRequestHeaders(HttpHeaderNames.CONTENT_TYPE,
-                                                   HttpHeaderNames.of("X-GRPC-WEB"));
+                                                   HttpHeaderNames.of("X-GRPC-WEB"))
+                              // Expose trailers of the HTTP response to the client.
+                              .exposeHeaders(GrpcHeaderNames.GRPC_STATUS,
+                                             GrpcHeaderNames.GRPC_MESSAGE,
+                                             GrpcHeaderNames.ARMERIA_GRPC_THROWABLEPROTO_BIN);
 
     sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
                                        .supportedSerializationFormats(GrpcSerializationFormats.values())
@@ -144,8 +149,7 @@ you build a :api:`GrpcService`:
     Server server = sb.build();
     server.start();
 
-Please refer to `Cross-Origin Resource Sharing (CORS) <https://developer.mozilla.org/en-US/docs/Web/HTTP/CORS>`_
-by MDN for more information.
+Please refer to :ref:`server-cors` for more information.
 
 Unframed requests
 -----------------
@@ -161,21 +165,26 @@ can be used.
     ...
     sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
                                        .enableUnframedRequests(true)
+                                       // Needed to support JSON in addition to binary
+                                       .supportedSerializationFormats(GrpcSerializationFormats.PROTO,
+                                                                      GrpcSerializationFormats.JSON)
                                        .build());
     ...
     Server server = sb.build();
     server.start();
 
 This service's unary methods can be accessed from any HTTP client at e.g., URL ``/grpc.hello.HelloService/Hello``
-with Content-Type ``application/protobuf`` for binary protobuf POST body or ``application/json`` for JSON POST
-body.
+with Content-Type ``application/protobuf`` for binary protobuf POST body or ``application/json; charset=utf-8``
+for JSON POST body.
 
 Blocking service implementation
 -------------------------------
 
-Unlike upstream gRPC-java, Armeria does not run service logic in a separate thread pool. If your service
-implementation requires blocking, either run the individual blocking logic in a thread pool, or just wrap the
-entire service implementation in ``RequestContext.current().blockingTaskExecutor().submit``
+Unlike upstream gRPC-java, Armeria does not run service logic in a separate thread pool by default. If your
+service implementation requires blocking, either run the individual blocking logic in a thread pool, wrap the
+entire service implementation in ``RequestContext.current().blockingTaskExecutor().submit``, or set
+``GrpcServiceBuilder.useBlockingTaskExecutor()`` so the above happens automatically for all service methods
+and lifecycle callbacks.
 
 .. code-block:: java
 
@@ -197,6 +206,42 @@ entire service implementation in ``RequestContext.current().blockingTaskExecutor
         }
     }
 
+.. code-block:: java
+
+    import com.linecorp.armeria.common.RequestContext;
+    import com.linecorp.armeria.server.ServiceRequestContext;
+    import com.linecorp.armeria.server.grpc.GrpcServiceBuilder;
+
+    public class MyHelloService extends HelloServiceGrpc.HelloServiceImplBase {
+        @Override
+        public void hello(HelloRequest req, StreamObserver<HelloReply> responseObserver) {
+            Thread.sleep(10000);
+            HelloReply reply = HelloReply.newBuilder()
+                                         .setMessage("Hello, " + req.getName() + '!')
+                                         .build();
+            responseObserver.onNext(reply);
+            responseObserver.onCompleted();
+        }
+    }
+
+    ServerBuilder sb = new ServerBuilder();
+    sb.service(new GrpcServiceBuilder().addService(new MyHelloService())
+                                       // All service methods will be run within
+                                       // the blocking executor.
+                                       .useBlockingTaskExecutor(true)
+                                       .build());
+
+Exception propagation
+=====================
+
+It can be very useful to enable ``Flags.verboseResponses()`` in your server by specifying the
+``-Dcom.linecorp.armeria.verboseResponses=true`` system property, which will automatically return
+information about an exception thrown in the server to gRPC clients. Armeria clients will automatically
+convert it back into an exception for structured logging, etc. This response will include information about
+the actual source code in the server - make sure it is safe to send such potentially sensitive information
+to all your clients before enabling this flag!
+
+See more details at :ref:`client-grpc`.
 
 See also
 --------

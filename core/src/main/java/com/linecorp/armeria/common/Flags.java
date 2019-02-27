@@ -16,6 +16,9 @@
 
 package com.linecorp.armeria.common;
 
+import java.io.IOException;
+import java.nio.channels.ClosedChannelException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.IntPredicate;
@@ -24,6 +27,7 @@ import java.util.function.Predicate;
 
 import javax.annotation.Nullable;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,9 +45,14 @@ import com.linecorp.armeria.client.retry.RetryingHttpClient;
 import com.linecorp.armeria.client.retry.RetryingRpcClient;
 import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.server.PathMappingContext;
+import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.ServiceConfig;
+import com.linecorp.armeria.server.annotation.ExceptionHandler;
+import com.linecorp.armeria.server.annotation.ExceptionVerbosity;
 
 import io.netty.channel.epoll.Epoll;
+import io.netty.handler.codec.http2.Http2CodecUtil;
+import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.ssl.OpenSsl;
 
 /**
@@ -59,10 +68,16 @@ public final class Flags {
 
     private static final int NUM_CPU_CORES = Runtime.getRuntime().availableProcessors();
 
-    private static final boolean VERBOSE_EXCEPTION = getBoolean("verboseExceptions", false);
+    private static final boolean VERBOSE_EXCEPTIONS = getBoolean("verboseExceptions", false);
 
-    private static final boolean USE_EPOLL = getBoolean("useEpoll", Epoll.isAvailable(),
-                                                        value -> Epoll.isAvailable() || !value);
+    private static final boolean VERBOSE_SOCKET_EXCEPTIONS = getBoolean("verboseSocketExceptions", false);
+
+    private static final boolean VERBOSE_RESPONSES = getBoolean("verboseResponses", false);
+
+    private static final boolean HAS_WSLENV = System.getenv("WSLENV") != null;
+    private static final boolean USE_EPOLL = getBoolean("useEpoll", isEpollAvailable(),
+                                                        value -> isEpollAvailable() || !value);
+
     private static final boolean USE_OPENSSL = getBoolean("useOpenSsl", OpenSsl.isAvailable(),
                                                           value -> OpenSsl.isAvailable() || !value);
 
@@ -125,23 +140,56 @@ public final class Flags {
                     DEFAULT_DEFAULT_CLIENT_IDLE_TIMEOUT_MILLIS,
                     value -> value >= 0);
 
-    private static final int DEFAULT_DEFAULT_MAX_HTTP1_INITIAL_LINE_LENGTH =
-            4096; // from Netty default maxHttp1InitialLineLength
+    private static final int DEFAULT_DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE = 1024 * 1024; // 1MiB
+    private static final int DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE =
+            getInt("defaultHttp2InitialConnectionWindowSize",
+                   DEFAULT_DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE,
+                   value -> value > 0);
+
+    private static final int DEFAULT_DEFAULT_HTTP2_INITIAL_STREAM_WINDOW_SIZE = 1024 * 1024; // 1MiB
+    private static final int DEFAULT_HTTP2_INITIAL_STREAM_WINDOW_SIZE =
+            getInt("defaultHttp2InitialStreamWindowSize",
+                   DEFAULT_DEFAULT_HTTP2_INITIAL_STREAM_WINDOW_SIZE,
+                   value -> value > 0);
+
+    private static final int DEFAULT_DEFAULT_HTTP2_MAX_FRAME_SIZE = 16384; // From HTTP/2 specification
+    private static final int DEFAULT_HTTP2_MAX_FRAME_SIZE =
+            getInt("defaultHttp2MaxFrameSize",
+                   DEFAULT_DEFAULT_HTTP2_MAX_FRAME_SIZE,
+                   value -> value >= Http2CodecUtil.MAX_FRAME_SIZE_LOWER_BOUND &&
+                            value <= Http2CodecUtil.MAX_FRAME_SIZE_UPPER_BOUND);
+
+    // Can't use 0xFFFFFFFFL because some implementations use a signed 32-bit integer to store HTTP/2 SETTINGS
+    // parameter values, thus anything greater than 0x7FFFFFFF will break them or make them unhappy.
+    private static final long DEFAULT_DEFAULT_HTTP2_MAX_STREAMS_PER_CONNECTION = Integer.MAX_VALUE;
+    private static final long DEFAULT_HTTP2_MAX_STREAMS_PER_CONNECTION =
+            getLong("defaultHttp2MaxStreamsPerConnection",
+                    DEFAULT_DEFAULT_HTTP2_MAX_STREAMS_PER_CONNECTION,
+                    value -> value > 0 && value <= 0xFFFFFFFFL);
+
+    // from Netty default maxHeaderSize
+    private static final long DEFAULT_DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE = 8192;
+    private static final long DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE =
+            getLong("defaultHttp2MaxHeaderListSize",
+                    DEFAULT_DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE,
+                    value -> value > 0 && value <= 0xFFFFFFFFL);
+
+    private static final int DEFAULT_DEFAULT_HTTP1_MAX_INITIAL_LINE_LENGTH = 4096; // from Netty
     private static final int DEFAULT_MAX_HTTP1_INITIAL_LINE_LENGTH =
-            getInt("defaultMaxHttp1InitialLineLength",
-                   DEFAULT_DEFAULT_MAX_HTTP1_INITIAL_LINE_LENGTH,
+            getInt("defaultHttp1MaxInitialLineLength",
+                   DEFAULT_DEFAULT_HTTP1_MAX_INITIAL_LINE_LENGTH,
                    value -> value >= 0);
 
-    private static final int DEFAULT_DEFAULT_MAX_HTTP1_HEADER_SIZE = 8192; // from Netty default maxHeaderSize
+    private static final int DEFAULT_DEFAULT_HTTP1_MAX_HEADER_SIZE = 8192; // from Netty
     private static final int DEFAULT_MAX_HTTP1_HEADER_SIZE =
-            getInt("defaultMaxHttp1HeaderSize",
-                   DEFAULT_DEFAULT_MAX_HTTP1_HEADER_SIZE,
+            getInt("defaultHttp1MaxHeaderSize",
+                   DEFAULT_DEFAULT_HTTP1_MAX_HEADER_SIZE,
                    value -> value >= 0);
 
-    private static final int DEFAULT_DEFAULT_MAX_HTTP1_CHUNK_SIZE = 8192; // from Netty default maxChunkSize
-    private static final int DEFAULT_MAX_HTTP1_CHUNK_SIZE =
-            getInt("defaultMaxHttp1ChunkSize",
-                   DEFAULT_DEFAULT_MAX_HTTP1_CHUNK_SIZE,
+    private static final int DEFAULT_DEFAULT_HTTP1_MAX_CHUNK_SIZE = 8192; // from Netty
+    private static final int DEFAULT_HTTP1_MAX_CHUNK_SIZE =
+            getInt("defaultHttp1MaxChunkSize",
+                   DEFAULT_DEFAULT_HTTP1_MAX_CHUNK_SIZE,
                    value -> value >= 0);
 
     private static final boolean DEFAULT_USE_HTTP2_PREFACE = getBoolean("defaultUseHttp2Preface", true);
@@ -188,10 +236,23 @@ public final class Flags {
             CSV_SPLITTER.splitToList(getNormalized(
                     "cachedHeaders", DEFAULT_CACHED_HEADERS, CharMatcher.ascii()::matchesAllOf));
 
+    private static final String DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY = "unhandled";
+    private static final ExceptionVerbosity ANNOTATED_SERVICE_EXCEPTION_VERBOSITY =
+            exceptionLoggingMode("annotatedServiceExceptionVerbosity",
+                                 DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY);
+
     static {
-        if (!Epoll.isAvailable()) {
-            final Throwable cause = Exceptions.peel(Epoll.unavailabilityCause());
-            logger.info("/dev/epoll not available: {}", cause.toString());
+        if (!isEpollAvailable()) {
+            final Throwable cause = Epoll.unavailabilityCause();
+            if (cause != null) {
+                logger.info("/dev/epoll not available: {}", Exceptions.peel(cause).toString());
+            } else {
+                if (HAS_WSLENV) {
+                    logger.info("/dev/epoll not available: WSL not supported");
+                } else {
+                    logger.info("/dev/epoll not available: ?");
+                }
+            }
         } else if (USE_EPOLL) {
             logger.info("Using /dev/epoll");
         }
@@ -206,6 +267,12 @@ public final class Flags {
         }
     }
 
+    private static boolean isEpollAvailable() {
+        // Netty epoll transport does not work with WSL (Windows Sybsystem for Linux) yet.
+        // TODO(trustin): Re-enable on WSL if https://github.com/Microsoft/WSL/issues/1982 is resolved.
+        return Epoll.isAvailable() && !HAS_WSLENV;
+    }
+
     /**
      * Returns whether the verbose exception mode is enabled. When enabled, the exceptions frequently thrown by
      * Armeria will have full stack trace. When disabled, such exceptions will have empty stack trace to
@@ -215,7 +282,44 @@ public final class Flags {
      * JVM option to enable it.
      */
     public static boolean verboseExceptions() {
-        return VERBOSE_EXCEPTION;
+        return VERBOSE_EXCEPTIONS;
+    }
+
+    /**
+     * Returns whether to log the socket exceptions which are mostly harmless. If enabled, the following
+     * exceptions will be logged:
+     * <ul>
+     *   <li>{@link ClosedChannelException}</li>
+     *   <li>{@link ClosedSessionException}</li>
+     *   <li>{@link IOException} - 'Connection reset/closed/aborted by peer'</li>
+     *   <li>'Broken pipe'</li>
+     *   <li>{@link Http2Exception} - 'Stream closed'</li>
+     *   <li>{@link SSLException} - 'SSLEngine closed already'</li>
+     * </ul>
+     *
+     * <p>It is recommended to keep this flag disabled, because it increases the amount of log messages for
+     * the errors you usually do not have control over, e.g. unexpected socket disconnection due to network
+     * or remote peer issues.</p>
+     *
+     * <p>This flag is disabled by default.
+     * Specify the {@code -Dcom.linecorp.armeria.verboseSocketExceptions=true} JVM option to enable it.</p>
+     *
+     * @see Exceptions#isExpected(Throwable)
+     */
+    public static boolean verboseSocketExceptions() {
+        return VERBOSE_SOCKET_EXCEPTIONS;
+    }
+
+    /**
+     * Returns whether the verbose response mode is enabled. When enabled, the server responses will contain
+     * the exception type and its full stack trace, which may be useful for debugging while potentially
+     * insecure. When disabled, the server responses will not expose such server-side details to the client.
+     *
+     * <p>This flag is disabled by default. Specify the {@code -Dcom.linecorp.armeria.verboseResponses=true}
+     * JVM option or use {@link ServerBuilder#verboseResponses(boolean)} to enable it.
+     */
+    public static boolean verboseResponses() {
+        return VERBOSE_RESPONSES;
     }
 
     /**
@@ -364,11 +468,11 @@ public final class Flags {
      * Returns the default maximum length of an HTTP/1 response initial line.
      * Note that this value has effect only if a user did not specify it.
      *
-     * <p>This default value of this flag is {@value #DEFAULT_DEFAULT_MAX_HTTP1_INITIAL_LINE_LENGTH}.
-     * Specify the {@code -Dcom.linecorp.armeria.defaultMaxHttp1InitialLineLength=<integer>} JVM option
+     * <p>This default value of this flag is {@value #DEFAULT_DEFAULT_HTTP1_MAX_INITIAL_LINE_LENGTH}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp1MaxInitialLineLength=<integer>} JVM option
      * to override the default value.
      */
-    public static int defaultMaxHttp1InitialLineLength() {
+    public static int defaultHttp1MaxInitialLineLength() {
         return DEFAULT_MAX_HTTP1_INITIAL_LINE_LENGTH;
     }
 
@@ -376,11 +480,11 @@ public final class Flags {
      * Returns the default maximum length of all headers in an HTTP/1 response.
      * Note that this value has effect only if a user did not specify it.
      *
-     * <p>This default value of this flag is {@value #DEFAULT_DEFAULT_MAX_HTTP1_HEADER_SIZE}.
-     * Specify the {@code -Dcom.linecorp.armeria.defaultMaxHttp1HeaderSize=<integer>} JVM option
+     * <p>This default value of this flag is {@value #DEFAULT_DEFAULT_HTTP1_MAX_HEADER_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp1MaxHeaderSize=<integer>} JVM option
      * to override the default value.
      */
-    public static int defaultMaxHttp1HeaderSize() {
+    public static int defaultHttp1MaxHeaderSize() {
         return DEFAULT_MAX_HTTP1_HEADER_SIZE;
     }
 
@@ -390,12 +494,12 @@ public final class Flags {
      * so that their lengths never exceed it.
      * Note that this value has effect only if a user did not specify it.
      *
-     * <p>This default value of this flag is {@value #DEFAULT_DEFAULT_MAX_HTTP1_CHUNK_SIZE}.
-     * Specify theb {@code -Dcom.linecorp.armeria.defaultMaxHttp1ChunkSize=<integer>} JVM option
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP1_MAX_CHUNK_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp1MaxChunkSize=<integer>} JVM option
      * to override the default value.
      */
-    public static int defaultMaxHttp1ChunkSize() {
-        return DEFAULT_MAX_HTTP1_CHUNK_SIZE;
+    public static int defaultHttp1MaxChunkSize() {
+        return DEFAULT_HTTP1_MAX_CHUNK_SIZE;
     }
 
     /**
@@ -418,6 +522,70 @@ public final class Flags {
      */
     public static boolean defaultUseHttp1Pipelining() {
         return DEFAULT_USE_HTTP1_PIPELINING;
+    }
+
+    /**
+     * Returns the default value of the {@link ServerBuilder#http2InitialConnectionWindowSize(int)} and
+     * {@link ClientFactoryBuilder#http2InitialConnectionWindowSize(int)} option.
+     * Note that this value has effect only if a user did not specify it.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp2InitialConnectionWindowSize=<integer>} JVM option
+     * to override the default value.
+     */
+    public static int defaultHttp2InitialConnectionWindowSize() {
+        return DEFAULT_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE;
+    }
+
+    /**
+     * Returns the default value of the {@link ServerBuilder#http2InitialStreamWindowSize(int)} and
+     * {@link ClientFactoryBuilder#http2InitialStreamWindowSize(int)} option.
+     * Note that this value has effect only if a user did not specify it.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP2_INITIAL_STREAM_WINDOW_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp2InitialStreamWindowSize=<integer>} JVM option
+     * to override the default value.
+     */
+    public static int defaultHttp2InitialStreamWindowSize() {
+        return DEFAULT_HTTP2_INITIAL_STREAM_WINDOW_SIZE;
+    }
+
+    /**
+     * Returns the default value of the {@link ServerBuilder#http2MaxFrameSize(int)} and
+     * {@link ClientFactoryBuilder#http2MaxFrameSize(int)} option.
+     * Note that this value has effect only if a user did not specify it.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP2_MAX_FRAME_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp2MaxFrameSize=<integer>} JVM option
+     * to override the default value.
+     */
+    public static int defaultHttp2MaxFrameSize() {
+        return DEFAULT_HTTP2_MAX_FRAME_SIZE;
+    }
+
+    /**
+     * Returns the default value of the {@link ServerBuilder#http2MaxStreamsPerConnection(long)} option.
+     * Note that this value has effect only if a user did not specify it.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP2_MAX_STREAMS_PER_CONNECTION}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp2MaxStreamsPerConnection=<integer>} JVM option
+     * to override the default value.
+     */
+    public static long defaultHttp2MaxStreamsPerConnection() {
+        return DEFAULT_HTTP2_MAX_STREAMS_PER_CONNECTION;
+    }
+
+    /**
+     * Returns the default value of the {@link ServerBuilder#http2MaxHeaderListSize(long)} and
+     * {@link ClientFactoryBuilder#http2MaxHeaderListSize(long)} option.
+     * Note that this value has effect only if a user did not specify it.
+     *
+     * <p>The default value of this flag is {@value #DEFAULT_DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE}.
+     * Specify the {@code -Dcom.linecorp.armeria.defaultHttp2MaxHeaderListSize=<integer>} JVM option
+     * to override the default value.
+     */
+    public static long defaultHttp2MaxHeaderListSize() {
+        return DEFAULT_HTTP2_MAX_HEADER_LIST_SIZE;
     }
 
     /**
@@ -509,6 +677,28 @@ public final class Flags {
         return COMPOSITE_SERVICE_CACHE_SPEC;
     }
 
+    /**
+     * Returns the verbosity of exceptions logged by annotated HTTP services. The value of this property
+     * is one of the following:
+     * <ul>
+     *     <li>{@link ExceptionVerbosity#ALL} - logging all exceptions raised from annotated HTTP services</li>
+     *     <li>{@link ExceptionVerbosity#UNHANDLED} - logging exceptions which are not handled by
+     *     {@link ExceptionHandler}s provided by a user and are not well-known exceptions
+     *     <li>{@link ExceptionVerbosity#NONE} - no logging exceptions</li>
+     * </ul>
+     * A log message would be written at {@code WARN} level.
+     *
+     * <p>The default value of this flag is {@value DEFAULT_ANNOTATED_SERVICE_EXCEPTION_VERBOSITY}.
+     * Specify the
+     * {@code -Dcom.linecorp.armeria.annotatedServiceExceptionVerbosity=<all|unhandled|none>} JVM option
+     * to override the default value.
+     *
+     * @see ExceptionVerbosity
+     */
+    public static ExceptionVerbosity annotatedServiceExceptionVerbosity() {
+        return ANNOTATED_SERVICE_EXCEPTION_VERBOSITY;
+    }
+
     private static Optional<String> caffeineSpec(String name, String defaultValue) {
         final String spec = get(name, defaultValue, value -> {
             try {
@@ -522,6 +712,13 @@ public final class Flags {
         });
         return "off".equals(spec) ? Optional.empty()
                                   : Optional.of(spec);
+    }
+
+    private static ExceptionVerbosity exceptionLoggingMode(String name, String defaultValue) {
+        final String mode = getNormalized(name, defaultValue,
+                                          value -> Arrays.stream(ExceptionVerbosity.values())
+                                                         .anyMatch(v -> v.name().equalsIgnoreCase(value)));
+        return ExceptionVerbosity.valueOf(mode.toUpperCase());
     }
 
     private static boolean getBoolean(String name, boolean defaultValue) {

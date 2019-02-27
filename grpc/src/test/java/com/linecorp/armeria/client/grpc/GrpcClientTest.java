@@ -18,6 +18,7 @@ package com.linecorp.armeria.client.grpc;
 
 import static com.linecorp.armeria.grpc.testing.Messages.PayloadType.COMPRESSABLE;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.assertj.core.api.Assertions.fail;
 import static org.awaitility.Awaitility.await;
@@ -49,7 +50,6 @@ import org.junit.rules.TestRule;
 import org.junit.rules.Timeout;
 import org.mockito.ArgumentCaptor;
 
-import com.google.common.base.Throwables;
 import com.google.protobuf.ByteString;
 
 import com.linecorp.armeria.client.ClientBuilder;
@@ -66,9 +66,11 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.EventLoopGroups;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.grpc.testing.Messages.EchoStatus;
 import com.linecorp.armeria.grpc.testing.Messages.Payload;
 import com.linecorp.armeria.grpc.testing.Messages.ResponseParameters;
@@ -82,7 +84,6 @@ import com.linecorp.armeria.grpc.testing.TestServiceGrpc;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc.TestServiceBlockingStub;
 import com.linecorp.armeria.grpc.testing.TestServiceGrpc.TestServiceStub;
 import com.linecorp.armeria.grpc.testing.UnimplementedServiceGrpc;
-import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 import com.linecorp.armeria.internal.grpc.StreamRecorder;
 import com.linecorp.armeria.internal.grpc.TestServiceImpl;
@@ -169,12 +170,12 @@ public class GrpcClientTest {
 
         blockingStub = new ClientBuilder("gproto+" + server.httpUri("/"))
                 .defaultMaxResponseLength(MAX_MESSAGE_SIZE)
-                .decorator(HttpRequest.class, HttpResponse.class, new LoggingClientBuilder().newDecorator())
-                .decorator(HttpRequest.class, HttpResponse.class, requestLogRecorder)
+                .decorator(new LoggingClientBuilder().newDecorator())
+                .decorator(requestLogRecorder)
                 .build(TestServiceBlockingStub.class);
         asyncStub = new ClientBuilder("gproto+" + server.httpUri("/"))
-                .decorator(HttpRequest.class, HttpResponse.class, new LoggingClientBuilder().newDecorator())
-                .decorator(HttpRequest.class, HttpResponse.class, requestLogRecorder)
+                .decorator(new LoggingClientBuilder().newDecorator())
+                .decorator(requestLogRecorder)
                 .build(TestServiceStub.class);
     }
 
@@ -217,7 +218,7 @@ public class GrpcClientTest {
     }
 
     @Test
-    public void largeUnary_unsafe() {
+    public void largeUnary_unsafe() throws Exception {
         final SimpleRequest request =
                 SimpleRequest.newBuilder()
                              .setResponseSize(314159)
@@ -234,27 +235,43 @@ public class GrpcClientTest {
 
         final TestServiceStub stub = new ClientBuilder("gproto+" + server.httpUri("/"))
                 .option(GrpcClientOptions.UNSAFE_WRAP_RESPONSE_BUFFERS.newValue(true))
-                .decorator(HttpRequest.class, HttpResponse.class, new LoggingClientBuilder().newDecorator())
+                .decorator(new LoggingClientBuilder().newDecorator())
                 .build(TestServiceStub.class);
+
+        final BlockingQueue<Object> resultQueue = new LinkedTransferQueue<>();
         stub.unaryCall(request, new StreamObserver<SimpleResponse>() {
             @Override
             public void onNext(SimpleResponse value) {
-                final RequestContext ctx = RequestContext.current();
-                assertThat(value).isEqualTo(goldenResponse);
-                final ByteBuf buf = ctx.attr(GrpcUnsafeBufferUtil.BUFFERS).get().get(value);
-                assertThat(buf.refCnt()).isNotZero();
-                GrpcUnsafeBufferUtil.releaseBuffer(value, ctx);
-                assertThat(buf.refCnt()).isZero();
+                try {
+                    final RequestContext ctx = RequestContext.current();
+                    assertThat(value).isEqualTo(goldenResponse);
+                    final ByteBuf buf = ctx.attr(GrpcUnsafeBufferUtil.BUFFERS).get().get(value);
+                    assertThat(buf.refCnt()).isNotZero();
+                    GrpcUnsafeBufferUtil.releaseBuffer(value, ctx);
+                    assertThat(buf.refCnt()).isZero();
+                } catch (Throwable t) {
+                    resultQueue.add(t);
+                }
             }
 
             @Override
             public void onError(Throwable t) {
+                resultQueue.add(t);
             }
 
             @Override
             public void onCompleted() {
+                resultQueue.add("OK");
             }
         });
+
+        final Object result = resultQueue.poll(10, TimeUnit.SECONDS);
+        if (result instanceof Throwable) {
+            Exceptions.throwUnsafely((Throwable) result);
+        } else {
+            assertThat(result).isEqualTo("OK");
+            assertThat(resultQueue.poll(1, TimeUnit.SECONDS)).isNull();
+        }
     }
 
     @Test
@@ -931,7 +948,7 @@ public class GrpcClientTest {
         final Throwable t = catchThrowable(() -> stub.streamingOutputCall(request).next());
         assertThat(t).isInstanceOf(StatusRuntimeException.class);
         assertThat(((StatusRuntimeException) t).getStatus().getCode()).isEqualTo(Code.RESOURCE_EXHAUSTED);
-        assertThat(Throwables.getStackTraceAsString(t)).contains("exceeds maximum");
+        assertThat(Exceptions.traceText(t)).contains("exceeds maximum");
 
         checkRequestLog((rpcReq, rpcRes, grpcStatus) -> {
             assertThat(rpcReq.params()).containsExactly(request);
@@ -970,7 +987,7 @@ public class GrpcClientTest {
         final Throwable t = catchThrowable(() -> stub.streamingOutputCall(request).next());
         assertThat(t).isInstanceOf(StatusRuntimeException.class);
         assertThat(((StatusRuntimeException) t).getStatus().getCode()).isEqualTo(Code.CANCELLED);
-        assertThat(Throwables.getStackTraceAsString(t)).contains("message too large");
+        assertThat(Exceptions.traceText(t)).contains("message too large");
 
         checkRequestLog((rpcReq, rpcRes, grpcStatus) -> {
             assertThat(rpcReq.params()).containsExactly(request);
@@ -990,10 +1007,10 @@ public class GrpcClientTest {
         final SimpleRequest simpleRequest = SimpleRequest.newBuilder()
                                                          .setResponseStatus(responseStatus)
                                                          .build();
-        final StreamingOutputCallRequest streamingRequest = StreamingOutputCallRequest.newBuilder()
-                                                                                      .setResponseStatus(
-                                                                                        responseStatus)
-                                                                                      .build();
+        final StreamingOutputCallRequest streamingRequest =
+                StreamingOutputCallRequest.newBuilder()
+                                          .setResponseStatus(responseStatus)
+                                          .build();
 
         // Test UnaryCall
         final Throwable t = catchThrowable(() -> blockingStub.unaryCall(simpleRequest));
@@ -1099,6 +1116,20 @@ public class GrpcClientTest {
         // status so we don't verify it for now.
         //assertThat(Status.fromThrowable(responseObserver.getError()).getCode())
         //.isEqualTo(Status.DEADLINE_EXCEEDED.getCode());
+    }
+
+    @Test
+    public void nonAsciiStatusMessage() {
+        final String statusMessage = "ほげほげ";
+        assertThatThrownBy(() -> blockingStub.unaryCall(
+                SimpleRequest.newBuilder()
+                             .setResponseStatus(EchoStatus.newBuilder()
+                                                          .setCode(2)
+                                                          .setMessage(statusMessage))
+                             .build()))
+                .isInstanceOfSatisfying(StatusRuntimeException.class,
+                                        e -> assertThat(e.getStatus().getDescription())
+                                                .isEqualTo(statusMessage));
     }
 
     private static void assertSuccess(StreamRecorder<?> recorder) {

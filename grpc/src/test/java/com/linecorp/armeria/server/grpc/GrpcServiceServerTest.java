@@ -20,9 +20,11 @@ import static com.linecorp.armeria.internal.grpc.GrpcTestUtil.REQUEST_MESSAGE;
 import static com.linecorp.armeria.internal.grpc.GrpcTestUtil.RESPONSE_MESSAGE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.assertj.core.api.Assertions.entry;
 import static org.awaitility.Awaitility.await;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedTransferQueue;
 import java.util.concurrent.TimeUnit;
@@ -39,8 +41,12 @@ import org.junit.Test;
 import org.junit.rules.DisableOnDebug;
 import org.junit.rules.TestRule;
 import org.junit.rules.Timeout;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
+import org.junit.runners.Parameterized.Parameters;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.ImmutableList;
 import com.google.common.primitives.Bytes;
 import com.google.common.primitives.Ints;
 import com.google.protobuf.ByteString;
@@ -62,6 +68,7 @@ import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
 import com.linecorp.armeria.common.SessionProtocol;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.common.grpc.GrpcSerializationFormats;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
@@ -77,7 +84,6 @@ import com.linecorp.armeria.grpc.testing.UnitTestServiceGrpc.UnitTestServiceBloc
 import com.linecorp.armeria.grpc.testing.UnitTestServiceGrpc.UnitTestServiceImplBase;
 import com.linecorp.armeria.grpc.testing.UnitTestServiceGrpc.UnitTestServiceStub;
 import com.linecorp.armeria.internal.PathAndQuery;
-import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 import com.linecorp.armeria.internal.grpc.GrpcTestUtil;
 import com.linecorp.armeria.internal.grpc.StreamRecorder;
@@ -99,11 +105,17 @@ import io.netty.util.AsciiString;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
+@RunWith(Parameterized.class)
 public class GrpcServiceServerTest {
 
     private static final int MAX_MESSAGE_SIZE = 16 * 1024 * 1024;
 
     private static AsciiString LARGE_PAYLOAD;
+
+    @Parameters(name = "{index}: useBlockingExecutor={0}")
+    public static Collection<Boolean> parameters() {
+        return ImmutableList.of(false, true);
+    }
 
     @BeforeClass
     public static void createLargePayload() {
@@ -286,10 +298,75 @@ public class GrpcServiceServerTest {
         }
     };
 
+    @ClassRule
+    public static ServerRule serverWithBlockingExecutor = new ServerRule() {
+        @Override
+        protected void configure(ServerBuilder sb) throws Exception {
+            sb.workerGroup(EventLoopGroups.newEventLoopGroup(1), true);
+            sb.defaultMaxRequestLength(0);
+
+            sb.serviceUnder("/", new GrpcServiceBuilder()
+                    .setMaxInboundMessageSizeBytes(MAX_MESSAGE_SIZE)
+                    .addService(new UnitTestServiceImpl())
+                    .enableUnframedRequests(true)
+                    .supportedSerializationFormats(GrpcSerializationFormats.values())
+                    .useBlockingTaskExecutor(true)
+                    .build()
+                    .decorate(LoggingService.newDecorator())
+                    .decorate((delegate, ctx, req) -> {
+                        ctx.log().addListener(requestLogQueue::add, RequestLogAvailability.COMPLETE);
+                        return delegate.serve(ctx, req);
+                    }));
+        }
+    };
+
+    @ClassRule
+    public static ServerRule serverWithNoMaxMessageSize = new ServerRule() {
+        @Override
+        protected void configure(ServerBuilder sb) throws Exception {
+            sb.workerGroup(EventLoopGroups.newEventLoopGroup(1), true);
+            sb.defaultMaxRequestLength(0);
+
+            sb.serviceUnder("/", new GrpcServiceBuilder()
+                    .addService(new UnitTestServiceImpl())
+                    .build()
+                    .decorate(LoggingService.newDecorator())
+                    .decorate((delegate, ctx, req) -> {
+                        ctx.log().addListener(requestLogQueue::add, RequestLogAvailability.COMPLETE);
+                        return delegate.serve(ctx, req);
+                    }));
+        }
+    };
+
+    @ClassRule
+    public static ServerRule serverWithLongMaxRequestLimit = new ServerRule() {
+        @Override
+        protected void configure(ServerBuilder sb) throws Exception {
+            sb.workerGroup(EventLoopGroups.newEventLoopGroup(1), true);
+            sb.defaultMaxRequestLength(Long.MAX_VALUE);
+
+            sb.serviceUnder("/", new GrpcServiceBuilder()
+                    .addService(new UnitTestServiceImpl())
+                    .build()
+                    .decorate(LoggingService.newDecorator())
+                    .decorate((delegate, ctx, req) -> {
+                        ctx.log().addListener(requestLogQueue::add, RequestLogAvailability.COMPLETE);
+                        return delegate.serve(ctx, req);
+                    }));
+        }
+    };
+
     @Rule
     public TestRule globalTimeout = new DisableOnDebug(new Timeout(10, TimeUnit.SECONDS));
 
     private static ManagedChannel channel;
+    private static ManagedChannel blockingChannel;
+
+    private final boolean useBlockingExecutor;
+
+    public GrpcServiceServerTest(boolean useBlockingExecutor) {
+        this.useBlockingExecutor = useBlockingExecutor;
+    }
 
     private UnitTestServiceBlockingStub blockingClient;
     private UnitTestServiceStub streamingClient;
@@ -299,19 +376,23 @@ public class GrpcServiceServerTest {
         channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.httpPort())
                                        .usePlaintext()
                                        .build();
+        blockingChannel = ManagedChannelBuilder.forAddress("127.0.0.1", serverWithBlockingExecutor.httpPort())
+                                               .usePlaintext()
+                                               .build();
     }
 
     @AfterClass
     public static void tearDownChannel() {
         channel.shutdownNow();
+        blockingChannel.shutdownNow();
     }
 
     @Before
     public void setUp() {
         COMPLETED.set(false);
         CLIENT_CLOSED.set(false);
-        blockingClient = UnitTestServiceGrpc.newBlockingStub(channel);
-        streamingClient = UnitTestServiceGrpc.newStub(channel);
+        blockingClient = UnitTestServiceGrpc.newBlockingStub(useBlockingExecutor ? blockingChannel : channel);
+        streamingClient = UnitTestServiceGrpc.newStub(useBlockingExecutor ? blockingChannel : channel);
 
         PathAndQuery.clearCachedPaths();
         requestLogQueue.clear();
@@ -322,8 +403,8 @@ public class GrpcServiceServerTest {
         assertThat(blockingClient.staticUnaryCall(REQUEST_MESSAGE)).isEqualTo(RESPONSE_MESSAGE);
 
         // Confirm gRPC paths are cached despite using serviceUnder
-        assertThat(PathAndQuery.cachedPaths())
-                .contains("/armeria.grpc.testing.UnitTestService/StaticUnaryCall");
+        await().untilAsserted(() -> assertThat(PathAndQuery.cachedPaths())
+                .contains("/armeria.grpc.testing.UnitTestService/StaticUnaryCall"));
 
         checkRequestLog((rpcReq, rpcRes, grpcStatus) -> {
             assertThat(rpcReq.method()).isEqualTo("armeria.grpc.testing.UnitTestService/StaticUnaryCall");
@@ -454,19 +535,12 @@ public class GrpcServiceServerTest {
 
     @Test
     public void tooLargeRequest_uncompressed() throws Exception {
-        final SimpleRequest request = SimpleRequest.newBuilder()
-                                                   .setPayload(
-                                                     Payload.newBuilder()
-                                                            .setBody(ByteString.copyFrom(
-                                                                    LARGE_PAYLOAD.toByteArray())))
-                                                   .build();
+        final SimpleRequest request = newLargeRequest();
         final StatusRuntimeException t =
                 (StatusRuntimeException) catchThrowable(
                         () -> blockingClient.staticUnaryCall(request));
-        // NB: Since gRPC does not support HTTP/1, it just resets the stream with an HTTP/2 CANCEL error code,
-        // which clients would interpret as Code.CANCELLED. Armeria supports HTTP/1, so more generically returns
-        // an HTTP 500.
-        assertThat(t.getStatus().getCode()).isEqualTo(Code.UNKNOWN);
+
+        assertThat(t.getStatus().getCode()).isEqualTo(Code.CANCELLED);
 
         checkRequestLogStatus(grpcStatus -> {
             assertThat(grpcStatus.getCode()).isEqualTo(Code.RESOURCE_EXHAUSTED);
@@ -475,23 +549,23 @@ public class GrpcServiceServerTest {
 
     @Test
     public void tooLargeRequest_compressed() throws Exception {
-        final SimpleRequest request = SimpleRequest.newBuilder()
-                                                   .setPayload(
-                                                     Payload.newBuilder()
-                                                            .setBody(ByteString.copyFrom(
-                                                                    LARGE_PAYLOAD.toByteArray())))
-                                                   .build();
+        final SimpleRequest request = newLargeRequest();
         final StatusRuntimeException t =
                 (StatusRuntimeException) catchThrowable(
                         () -> blockingClient.withCompression("gzip").staticUnaryCall(request));
-        // NB: Since gRPC does not support HTTP/1, it just resets the stream with an HTTP/2 CANCEL error code,
-        // which clients would interpret as Code.CANCELLED. Armeria supports HTTP/1, so more generically returns
-        // an HTTP 500.
-        assertThat(t.getStatus().getCode()).isEqualTo(Code.UNKNOWN);
+
+        assertThat(t.getStatus().getCode()).isEqualTo(Code.CANCELLED);
 
         checkRequestLogStatus(grpcStatus -> {
             assertThat(grpcStatus.getCode()).isEqualTo(Code.RESOURCE_EXHAUSTED);
         });
+    }
+
+    private static SimpleRequest newLargeRequest() {
+        return SimpleRequest.newBuilder()
+                            .setPayload(Payload.newBuilder()
+                                               .setBody(ByteString.copyFrom(LARGE_PAYLOAD.toByteArray())))
+                            .build();
     }
 
     @Test
@@ -754,19 +828,30 @@ public class GrpcServiceServerTest {
     }
 
     @Test
+    public void grpcWeb_error() throws Exception {
+        final HttpClient client = HttpClient.of(server.httpUri("/"));
+        final AggregatedHttpMessage response = client.execute(
+                HttpHeaders.of(HttpMethod.POST,
+                               UnitTestServiceGrpc.getErrorWithMessageMethod().getFullMethodName())
+                           .set(HttpHeaderNames.CONTENT_TYPE, "application/grpc-web"),
+                GrpcTestUtil.uncompressedFrame(GrpcTestUtil.requestByteBuf())).aggregate().get();
+        assertThat(response.headers()).contains(entry(GrpcHeaderNames.GRPC_STATUS, "10"),
+                                                entry(GrpcHeaderNames.GRPC_MESSAGE, "aborted call"));
+    }
+
+    @Test
     public void json() throws Exception {
         final AtomicReference<HttpHeaders> requestHeaders = new AtomicReference<>();
         final UnitTestServiceBlockingStub jsonStub =
                 new ClientBuilder(server.httpUri(GrpcSerializationFormats.JSON, "/"))
-                        .decorator(HttpRequest.class, HttpResponse.class,
-                                   client -> new SimpleDecoratingClient<HttpRequest, HttpResponse>(client) {
-                                       @Override
-                                       public HttpResponse execute(ClientRequestContext ctx, HttpRequest req)
-                                               throws Exception {
-                                           requestHeaders.set(req.headers());
-                                           return delegate().execute(ctx, req);
-                                       }
-                                   })
+                        .decorator(client -> new SimpleDecoratingClient<HttpRequest, HttpResponse>(client) {
+                            @Override
+                            public HttpResponse execute(ClientRequestContext ctx, HttpRequest req)
+                                    throws Exception {
+                                requestHeaders.set(req.headers());
+                                return delegate().execute(ctx, req);
+                            }
+                        })
                         .build(UnitTestServiceBlockingStub.class);
         final SimpleResponse response = jsonStub.staticUnaryCall(REQUEST_MESSAGE);
         assertThat(response).isEqualTo(RESPONSE_MESSAGE);
@@ -777,6 +862,35 @@ public class GrpcServiceServerTest {
             assertThat(rpcReq.params()).containsExactly(REQUEST_MESSAGE);
             assertThat(rpcRes.get()).isEqualTo(RESPONSE_MESSAGE);
         });
+    }
+
+    @Test
+    public void noMaxMessageSize() {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1",
+                                                                  serverWithNoMaxMessageSize.httpPort())
+                                                      .usePlaintext()
+                                                      .build();
+
+        try {
+            UnitTestServiceBlockingStub stub = UnitTestServiceGrpc.newBlockingStub(channel);
+            assertThat(stub.staticUnaryCall(REQUEST_MESSAGE)).isEqualTo(RESPONSE_MESSAGE);
+        } finally {
+            channel.shutdownNow();
+        }
+    }
+
+    @Test
+    public void longMaxRequestLimit() {
+        ManagedChannel channel = ManagedChannelBuilder.forAddress("127.0.0.1",
+                                                                  serverWithLongMaxRequestLimit.httpPort())
+                                                      .usePlaintext()
+                                                      .build();
+        try {
+            UnitTestServiceBlockingStub stub = UnitTestServiceGrpc.newBlockingStub(channel);
+            assertThat(stub.staticUnaryCall(REQUEST_MESSAGE)).isEqualTo(RESPONSE_MESSAGE);
+        } finally {
+            channel.shutdownNow();
+        }
     }
 
     private static void checkRequestLog(RequestLogChecker checker) throws Exception {

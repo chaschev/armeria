@@ -19,7 +19,6 @@ package com.linecorp.armeria.server;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 
 import javax.annotation.Nullable;
 
@@ -36,14 +35,13 @@ import com.linecorp.armeria.common.HttpMethod;
 import com.linecorp.armeria.common.HttpObject;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.HttpStatusClass;
-import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.common.stream.AbortedStreamException;
 import com.linecorp.armeria.internal.Http1ObjectEncoder;
 import com.linecorp.armeria.internal.HttpObjectEncoder;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
-import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http2.Http2Error;
@@ -68,7 +66,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
     private final HttpObjectEncoder responseEncoder;
     private final DecodedHttpRequest req;
     private final DefaultServiceRequestContext reqCtx;
-    private final Consumer<RequestLog> accessLogWriter;
+    private final AccessLogWriter accessLogWriter;
     private final long startTimeNanos;
 
     @Nullable
@@ -78,9 +76,11 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
     private State state = State.NEEDS_HEADERS;
     private boolean isComplete;
 
+    private boolean loggedResponseHeadersFirstBytesTransferred;
+
     HttpResponseSubscriber(ChannelHandlerContext ctx, HttpObjectEncoder responseEncoder,
                            DefaultServiceRequestContext reqCtx, DecodedHttpRequest req,
-                           Consumer<RequestLog> accessLogWriter) {
+                           AccessLogWriter accessLogWriter) {
         this.ctx = ctx;
         this.responseEncoder = responseEncoder;
         this.req = req;
@@ -160,7 +160,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                             " (service: " + service() + ')');
                 }
 
-                HttpHeaders headers = (HttpHeaders) o;
+                final HttpHeaders headers = (HttpHeaders) o;
                 final HttpStatus status = headers.status();
                 if (status == null) {
                     throw newIllegalStateException("published an HttpHeaders without status: " + o +
@@ -173,16 +173,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                 }
 
                 final HttpHeaders additionalHeaders = reqCtx.additionalResponseHeaders();
-                if (!additionalHeaders.isEmpty()) {
-                    if (headers.isImmutable()) {
-                        // All headers are already validated.
-                        final HttpHeaders temp = headers;
-                        headers = new DefaultHttpHeaders(false, temp.size() + additionalHeaders.size());
-                        headers.set(temp);
-                        o = headers;
-                    }
-                    headers.setAllIfAbsent(additionalHeaders);
-                }
+                o = fillAdditionalHeaders(headers, additionalHeaders);
 
                 logBuilder().responseHeaders(headers);
 
@@ -215,9 +206,18 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                                 "published a trailing HttpHeaders with status: " + o +
                                 " (service: " + service() + ')');
                     }
+                    final HttpHeaders additionalTrailers = reqCtx.additionalResponseTrailers();
+                    o = fillAdditionalHeaders(trailingHeaders, additionalTrailers);
 
                     // Trailing headers always end the stream even if not explicitly set.
                     endOfStream = true;
+                } else if (endOfStream) { // Last DATA frame
+                    final HttpHeaders additionalTrailers = reqCtx.additionalResponseTrailers();
+                    if (!additionalTrailers.isEmpty()) {
+                        write(o, false);
+
+                        o = additionalTrailers;
+                    }
                 }
                 break;
             }
@@ -236,7 +236,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
             // If timeout occurs, respond with 503 Service Unavailable.
             ((HttpResponseException) cause).httpResponse()
                                            .aggregate(ctx.executor())
-                                           .whenCompleteAsync((message, throwable) -> {
+                                           .handleAsync((message, throwable) -> {
                                                if (throwable != null) {
                                                    failAndRespond(throwable,
                                                                   INTERNAL_SERVER_ERROR_MESSAGE,
@@ -244,6 +244,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                                                } else {
                                                    failAndRespond(cause, message, Http2Error.CANCEL);
                                                }
+                                               return null;
                                            }, ctx.executor());
         } else if (cause instanceof HttpStatusException) {
             failAndRespond(cause,
@@ -271,35 +272,35 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
 
         if (wroteNothing(state)) {
             logger.warn("{} Published nothing (or only informational responses): {}", ctx.channel(), service());
-            responseEncoder.writeReset(ctx, req.id(), req.streamId(), Http2Error.INTERNAL_ERROR);
+            responseEncoder.writeReset(req.id(), req.streamId(), Http2Error.INTERNAL_ERROR);
             return;
         }
 
         if (state != State.DONE) {
-            write(HttpData.EMPTY_DATA, true);
+            final HttpHeaders additionalTrailers = reqCtx.additionalResponseTrailers();
+            if (!additionalTrailers.isEmpty()) {
+                write(additionalTrailers, true);
+            } else {
+                write(HttpData.EMPTY_DATA, true);
+            }
         }
     }
 
     private void write(HttpObject o, boolean endOfStream) {
-        final Channel ch = ctx.channel();
         if (endOfStream) {
             setDone();
         }
 
-        ch.eventLoop().execute(() -> write0(o, endOfStream));
-    }
-
-    private void write0(HttpObject o, boolean endOfStream) {
         final ChannelFuture future;
         final boolean wroteEmptyData;
         if (o instanceof HttpData) {
             final HttpData data = (HttpData) o;
             wroteEmptyData = data.isEmpty();
-            future = responseEncoder.writeData(ctx, req.id(), req.streamId(), data, endOfStream);
-            logBuilder().increaseResponseLength(data.length());
+            future = responseEncoder.writeData(req.id(), req.streamId(), data, endOfStream);
+            logBuilder().increaseResponseLength(data);
         } else if (o instanceof HttpHeaders) {
             wroteEmptyData = false;
-            future = responseEncoder.writeHeaders(ctx, req.id(), req.streamId(), (HttpHeaders) o, endOfStream);
+            future = responseEncoder.writeHeaders(req.id(), req.streamId(), (HttpHeaders) o, endOfStream);
         } else {
             // Should never reach here because we did validation in onNext().
             throw new Error();
@@ -324,9 +325,14 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
             // - every message has been sent successfully.
             // - any write operation is failed with a cause.
             if (isSuccess) {
+                if (!loggedResponseHeadersFirstBytesTransferred) {
+                    logBuilder().responseFirstBytesTransferred();
+                    loggedResponseHeadersFirstBytesTransferred = true;
+                }
+
                 if (endOfStream && tryComplete()) {
                     logBuilder().endResponse();
-                    reqCtx.log().addListener(accessLogWriter::accept, RequestLogAvailability.COMPLETE);
+                    reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
                 }
                 if (state != State.DONE) {
                     subscription.request(1);
@@ -338,7 +344,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                 setDone();
                 logBuilder().endResponse(f.cause());
                 subscription.cancel();
-                reqCtx.log().addListener(accessLogWriter::accept, RequestLogAvailability.COMPLETE);
+                reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
             }
             HttpServerHandler.CLOSE_ON_FAILURE.operationComplete(f);
         });
@@ -358,7 +364,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
         final HttpData content = message.content();
 
         logBuilder().responseHeaders(headers);
-        logBuilder().increaseResponseLength(content.length());
+        logBuilder().increaseResponseLength(content);
 
         final State oldState = setDone();
         subscription.cancel();
@@ -370,14 +376,14 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
         if (wroteNothing(oldState)) {
             // Did not write anything yet; we can send an error response instead of resetting the stream.
             if (content.isEmpty()) {
-                future = responseEncoder.writeHeaders(ctx, id, streamId, headers, true);
+                future = responseEncoder.writeHeaders(id, streamId, headers, true);
             } else {
-                responseEncoder.writeHeaders(ctx, id, streamId, headers, false);
-                future = responseEncoder.writeData(ctx, id, streamId, content, true);
+                responseEncoder.writeHeaders(id, streamId, headers, false);
+                future = responseEncoder.writeData(id, streamId, content, true);
             }
         } else {
             // Wrote something already; we have to reset/cancel the stream.
-            future = responseEncoder.writeReset(ctx, id, streamId, error);
+            future = responseEncoder.writeReset(id, streamId, error);
         }
 
         addCallbackAndFlush(cause, oldState, future);
@@ -388,7 +394,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
         subscription.cancel();
 
         final ChannelFuture future =
-                responseEncoder.writeReset(ctx, req.id(), req.streamId(), Http2Error.CANCEL);
+                responseEncoder.writeReset(req.id(), req.streamId(), Http2Error.CANCEL);
 
         addCallbackAndFlush(cause, oldState, future);
     }
@@ -399,7 +405,7 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
                 // Write an access log always with a cause. Respect the first specified cause.
                 if (tryComplete()) {
                     logBuilder().endResponse(cause);
-                    reqCtx.log().addListener(accessLogWriter::accept, RequestLogAvailability.COMPLETE);
+                    reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
                 }
             });
         }
@@ -416,6 +422,19 @@ final class HttpResponseSubscriber implements Subscriber<HttpObject>, RequestTim
 
     private static boolean wroteNothing(State state) {
         return state == State.NEEDS_HEADERS;
+    }
+
+    private static HttpHeaders fillAdditionalHeaders(HttpHeaders headers, HttpHeaders additionalHeaders) {
+        if (!additionalHeaders.isEmpty()) {
+            if (headers.isImmutable()) {
+                // All headers are already validated.
+                final HttpHeaders temp = headers;
+                headers = new DefaultHttpHeaders(false, temp.size() + additionalHeaders.size());
+                headers.set(temp);
+            }
+            headers.setAllIfAbsent(additionalHeaders);
+        }
+        return headers;
     }
 
     private boolean cancelTimeout() {

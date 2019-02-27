@@ -42,7 +42,6 @@ import org.reactivestreams.Subscription;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.client.ClientFactory;
@@ -64,6 +63,7 @@ import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.stream.StreamWriter;
 import com.linecorp.armeria.common.util.EventLoopGroups;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.internal.InboundTrafficController;
 import com.linecorp.armeria.testing.server.ServerRule;
 
@@ -168,8 +168,8 @@ public class HttpServerStreamingTest {
         final AggregatedHttpMessage res = f.get();
 
         assertThat(res.status()).isEqualTo(HttpStatus.REQUEST_ENTITY_TOO_LARGE);
-        assertThat(res.headers().contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-        assertThat(res.content().toStringUtf8()).isEqualTo("413 Request Entity Too Large");
+        assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+        assertThat(res.contentUtf8()).isEqualTo("413 Request Entity Too Large");
     }
 
     @Test(timeout = 10000)
@@ -179,8 +179,8 @@ public class HttpServerStreamingTest {
 
         final byte[] content = new byte[maxContentLength + 1];
         final AggregatedHttpMessage res = client().post("/non-existent", content).aggregate().get();
-        assertThat(res.headers().status()).isEqualTo(HttpStatus.NOT_FOUND);
-        assertThat(res.content().toStringUtf8()).isEqualTo("404 Not Found");
+        assertThat(res.status()).isEqualTo(HttpStatus.NOT_FOUND);
+        assertThat(res.contentUtf8()).isEqualTo("404 Not Found");
     }
 
     @Test(timeout = 60000)
@@ -212,8 +212,8 @@ public class HttpServerStreamingTest {
             final AggregatedHttpMessage res = f.get();
 
             assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.headers().contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
-            assertThat(res.content().toStringUtf8()).isEqualTo(
+            assertThat(res.contentType()).isEqualTo(MediaType.PLAIN_TEXT_UTF_8);
+            assertThat(res.contentUtf8()).isEqualTo(
                     String.valueOf(expectedContentLength));
         } finally {
             // Make sure the stream is closed even when this test fails due to timeout.
@@ -322,7 +322,7 @@ public class HttpServerStreamingTest {
                             HttpResponse.of(
                                     HttpStatus.INTERNAL_SERVER_ERROR,
                                     MediaType.PLAIN_TEXT_UTF_8,
-                                    Throwables.getStackTraceAsString(cause)));
+                                    Exceptions.traceText(cause)));
                 }
 
                 @Override

@@ -16,6 +16,8 @@
 
 package com.linecorp.armeria.internal;
 
+import static java.util.Objects.requireNonNull;
+
 import java.util.AbstractMap.SimpleImmutableEntry;
 import java.util.ArrayDeque;
 import java.util.Map.Entry;
@@ -32,9 +34,9 @@ import com.linecorp.armeria.common.stream.ClosedPublisherException;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufHolder;
 import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
-import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.DefaultHttpContent;
@@ -78,6 +80,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
      */
     private static final HttpContent EMPTY_CONTENT = new DefaultHttpContent(Unpooled.EMPTY_BUFFER);
 
+    private final Channel ch;
     private final boolean server;
     private final boolean isTls;
 
@@ -101,77 +104,78 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
      */
     private final IntObjectMap<PendingWrites> pendingWritesMap = new IntObjectHashMap<>();
 
-    public Http1ObjectEncoder(boolean server, boolean isTls) {
+    public Http1ObjectEncoder(Channel ch, boolean server, boolean isTls) {
+        this.ch = requireNonNull(ch, "ch");
         this.server = server;
         this.isTls = isTls;
     }
 
     @Override
-    protected ChannelFuture doWriteHeaders(ChannelHandlerContext ctx, int id, int streamId,
-                                           HttpHeaders headers, boolean endStream) {
+    protected Channel channel() {
+        return ch;
+    }
+
+    @Override
+    protected ChannelFuture doWriteHeaders(int id, int streamId, HttpHeaders headers, boolean endStream) {
         if (id >= minClosedId) {
-            return ctx.newFailedFuture(ClosedSessionException.get());
+            return newClosedSessionFuture();
         }
 
         try {
-            return server ? writeServerHeaders(ctx, id, streamId, headers, endStream)
-                          : writeClientHeaders(ctx, id, streamId, headers, endStream);
+            return server ? writeServerHeaders(id, streamId, headers, endStream)
+                          : writeClientHeaders(id, streamId, headers, endStream);
         } catch (Throwable t) {
-            return ctx.newFailedFuture(t);
+            return newFailedFuture(t);
         }
     }
 
     private ChannelFuture writeServerHeaders(
-            ChannelHandlerContext ctx, int id, int streamId,
-            HttpHeaders headers, boolean endStream) throws Http2Exception {
+            int id, int streamId, HttpHeaders headers, boolean endStream) throws Http2Exception {
 
         final HttpObject converted = convertServerHeaders(streamId, headers, endStream);
         final HttpStatus status = headers.status();
         if (status == null) {
             // Trailing headers
-            final ChannelFuture f = write(ctx, id, converted, endStream);
-            ctx.flush();
+            final ChannelFuture f = write(id, converted, endStream);
+            ch.flush();
             return f;
         }
 
         if (status.codeClass() == HttpStatusClass.INFORMATIONAL) {
             // Informational status headers.
-            final ChannelFuture f = write(ctx, id, converted, false);
+            final ChannelFuture f = write(id, converted, false);
             if (endStream) {
                 // Can't end a stream with informational status in HTTP/1.
                 f.addListener(ChannelFutureListener.CLOSE);
             }
-            ctx.flush();
+            ch.flush();
             return f;
         }
 
         // Non-informational status headers.
-        return writeNonInformationalHeaders(ctx, id, converted, endStream);
+        return writeNonInformationalHeaders(id, converted, endStream);
     }
 
     private ChannelFuture writeClientHeaders(
-            ChannelHandlerContext ctx, int id, int streamId,
-            HttpHeaders headers, boolean endStream) throws Http2Exception {
+            int id, int streamId, HttpHeaders headers, boolean endStream) throws Http2Exception {
 
-        return writeNonInformationalHeaders(
-                ctx, id, convertClientHeaders(streamId, headers, endStream), endStream);
+        return writeNonInformationalHeaders(id, convertClientHeaders(streamId, headers, endStream), endStream);
     }
 
-    private ChannelFuture writeNonInformationalHeaders(
-            ChannelHandlerContext ctx, int id, HttpObject converted, boolean endStream) {
+    private ChannelFuture writeNonInformationalHeaders(int id, HttpObject converted, boolean endStream) {
 
         ChannelFuture f;
         if (converted instanceof LastHttpContent) {
             assert endStream;
-            f = write(ctx, id, converted, true);
+            f = write(id, converted, true);
         } else {
-            f = write(ctx, id, converted, false);
+            f = write(id, converted, false);
             if (endStream) {
-                f = write(ctx, id, LastHttpContent.EMPTY_LAST_CONTENT, true);
+                f = write(id, LastHttpContent.EMPTY_LAST_CONTENT, true);
             }
         }
 
-        ctx.flush();
+        ch.flush();
         return f;
     }
 
@@ -196,10 +200,9 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
                     Unpooled.EMPTY_BUFFER, false);
 
             final io.netty.handler.codec.http.HttpHeaders outHeaders = res.headers();
-            convert(streamId, headers, outHeaders, false);
+            convert(streamId, headers, outHeaders, false, false);
 
-            if (informational) {
-                // 1xx responses does not have the 'content-length' header.
+            if (ArmeriaHttpUtil.isContentAlwaysEmpty(status)) {
                 outHeaders.remove(HttpHeaderNames.CONTENT_LENGTH);
             } else if (!headers.contains(HttpHeaderNames.CONTENT_LENGTH)) {
                 // NB: Set the 'content-length' only when not set rather than always setting to 0.
@@ -212,7 +215,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
         } else {
             res = new DefaultHttpResponse(HttpVersion.HTTP_1_1, nettyStatus, false);
             // Perform conversion.
-            convert(streamId, headers, res.headers(), false);
+            convert(streamId, headers, res.headers(), false, false);
             setTransferEncoding(res);
         }
 
@@ -236,11 +239,31 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
                 io.netty.handler.codec.http.HttpMethod.valueOf(method.name()),
                 path, false);
 
-        convert(streamId, headers, req.headers(), false);
+        convert(streamId, headers, req.headers(), false, true);
 
         if (endStream) {
             req.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
-            req.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+
+            // Set or remove the 'content-length' header depending on request method.
+            // See: https://tools.ietf.org/html/rfc7230#section-3.3.2
+            //
+            // > A user agent SHOULD send a Content-Length in a request message when
+            // > no Transfer-Encoding is sent and the request method defines a meaning
+            // > for an enclosed payload body.  For example, a Content-Length header
+            // > field is normally sent in a POST request even when the value is 0
+            // > (indicating an empty payload body).  A user agent SHOULD NOT send a
+            // > Content-Length header field when the request message does not contain
+            // > a payload body and the method semantics do not anticipate such a
+            // > body.
+            switch (method) {
+                case POST:
+                case PUT:
+                case PATCH:
+                    req.headers().set(HttpHeaderNames.CONTENT_LENGTH, "0");
+                    break;
+                default:
+                    req.headers().remove(HttpHeaderNames.CONTENT_LENGTH);
+            }
         } else if (HttpUtil.getContentLength(req, -1L) >= 0) {
             // Avoid the case where both 'content-length' and 'transfer-encoding' are set.
             req.headers().remove(HttpHeaderNames.TRANSFER_ENCODING);
@@ -251,12 +274,12 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
         return req;
     }
 
-    private void convert(
-            int streamId, HttpHeaders inHeaders,
-            io.netty.handler.codec.http.HttpHeaders outHeaders, boolean trailer) throws Http2Exception {
+    private void convert(int streamId, HttpHeaders inHeaders,
+                         io.netty.handler.codec.http.HttpHeaders outHeaders, boolean trailer,
+                         boolean isRequest) throws Http2Exception {
 
         ArmeriaHttpUtil.toNettyHttp1(
-                streamId, inHeaders, outHeaders, HttpVersion.HTTP_1_1, trailer, false);
+                streamId, inHeaders, outHeaders, HttpVersion.HTTP_1_1, trailer, isRequest);
 
         outHeaders.remove(ExtensionHeaderNames.STREAM_ID.text());
         if (server) {
@@ -272,7 +295,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
             lastContent = LastHttpContent.EMPTY_LAST_CONTENT;
         } else {
             lastContent = new DefaultLastHttpContent(Unpooled.EMPTY_BUFFER, false);
-            convert(streamId, headers, lastContent.trailingHeaders(), true);
+            convert(streamId, headers, lastContent.trailingHeaders(), true, false);
         }
         return lastContent;
     }
@@ -288,39 +311,36 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
     }
 
     @Override
-    protected ChannelFuture doWriteData(
-            ChannelHandlerContext ctx, int id, int streamId, HttpData data, boolean endStream) {
-
+    protected ChannelFuture doWriteData(int id, int streamId, HttpData data, boolean endStream) {
         if (id >= minClosedId) {
             ReferenceCountUtil.safeRelease(data);
-            return ctx.newFailedFuture(ClosedSessionException.get());
+            return newClosedSessionFuture();
         }
 
         final int length = data.length();
         if (length == 0) {
             ReferenceCountUtil.safeRelease(data);
             final HttpContent content = endStream ? LastHttpContent.EMPTY_LAST_CONTENT : EMPTY_CONTENT;
-            final ChannelFuture future = write(ctx, id, content, endStream);
-            ctx.flush();
+            final ChannelFuture future = write(id, content, endStream);
+            ch.flush();
             return future;
         }
 
         try {
             if (!isTls || length <= MAX_TLS_DATA_LENGTH) {
                 // Cleartext connection or data.length() <= MAX_TLS_DATA_LENGTH
-                return doWriteUnsplitData(ctx, id, data, endStream);
+                return doWriteUnsplitData(id, data, endStream);
             } else {
                 // TLS and data.length() > MAX_TLS_DATA_LENGTH
-                return doWriteSplitData(ctx, id, data, endStream);
+                return doWriteSplitData(id, data, endStream);
             }
         } catch (Throwable t) {
-            return ctx.newFailedFuture(t);
+            return newFailedFuture(t);
         }
     }
 
-    private ChannelFuture doWriteUnsplitData(ChannelHandlerContext ctx, int id, HttpData data,
-                                             boolean endStream) {
-        final ByteBuf buf = toByteBuf(ctx, data);
+    private ChannelFuture doWriteUnsplitData(int id, HttpData data, boolean endStream) {
+        final ByteBuf buf = toByteBuf(data);
         boolean handled = false;
         try {
             final HttpContent content;
@@ -330,9 +350,9 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
                 content = new DefaultHttpContent(buf);
             }
 
-            final ChannelFuture future = write(ctx, id, content, endStream);
+            final ChannelFuture future = write(id, content, endStream);
             handled = true;
-            ctx.flush();
+            ch.flush();
             return future;
         } finally {
             if (!handled) {
@@ -341,9 +361,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
         }
     }
 
-    private ChannelFuture doWriteSplitData(
-            ChannelHandlerContext ctx, int id, HttpData data, boolean endStream) {
-
+    private ChannelFuture doWriteSplitData(int id, HttpData data, boolean endStream) {
         try {
             int offset = data.offset();
             int remaining = data.length();
@@ -351,7 +369,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
             for (;;) {
                 // Ensure an HttpContent does not exceed the maximum length of a cleartext TLS record.
                 final int chunkSize = Math.min(MAX_TLS_DATA_LENGTH, remaining);
-                lastFuture = write(ctx, id, new DefaultHttpContent(dataChunk(data, offset, chunkSize)), false);
+                lastFuture = write(id, new DefaultHttpContent(dataChunk(data, offset, chunkSize)), false);
                 remaining -= chunkSize;
                 if (remaining == 0) {
                     break;
@@ -360,10 +378,10 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
             }
 
             if (endStream) {
-                lastFuture = write(ctx, id, LastHttpContent.EMPTY_LAST_CONTENT, true);
+                lastFuture = write(id, LastHttpContent.EMPTY_LAST_CONTENT, true);
             }
 
-            ctx.flush();
+            ch.flush();
             return lastFuture;
         } finally {
             ReferenceCountUtil.safeRelease(data);
@@ -379,22 +397,22 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
         }
     }
 
-    private ChannelFuture write(ChannelHandlerContext ctx, int id, HttpObject obj, boolean endStream) {
+    private ChannelFuture write(int id, HttpObject obj, boolean endStream) {
         if (id < currentId) {
             // Attempted to write something on a finished request/response; discard.
             // e.g. the request already timed out.
             ReferenceCountUtil.safeRelease(obj);
-            return ctx.newFailedFuture(ClosedPublisherException.get());
+            return newFailedFuture(ClosedPublisherException.get());
         }
 
         final PendingWrites currentPendingWrites = pendingWritesMap.get(id);
         if (id == currentId) {
             if (currentPendingWrites != null) {
                 pendingWritesMap.remove(id);
-                flushPendingWrites(ctx, currentPendingWrites);
+                flushPendingWrites(currentPendingWrites);
             }
 
-            final ChannelFuture future = ctx.write(obj);
+            final ChannelFuture future = ch.write(obj);
             if (endStream) {
                 currentId++;
 
@@ -405,7 +423,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
                         break;
                     }
 
-                    flushPendingWrites(ctx, nextPendingWrites);
+                    flushPendingWrites(nextPendingWrites);
                     if (!nextPendingWrites.isEndOfStream()) {
                         break;
                     }
@@ -417,7 +435,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
 
             return future;
         } else {
-            final ChannelPromise promise = ctx.newPromise();
+            final ChannelPromise promise = ch.newPromise();
             final Entry<HttpObject, ChannelPromise> entry = new SimpleImmutableEntry<>(obj, promise);
             final PendingWrites pendingWrites;
             if (currentPendingWrites == null) {
@@ -438,19 +456,19 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
         }
     }
 
-    private static void flushPendingWrites(ChannelHandlerContext ctx, PendingWrites pendingWrites) {
+    private void flushPendingWrites(PendingWrites pendingWrites) {
         for (;;) {
             final Entry<HttpObject, ChannelPromise> e = pendingWrites.poll();
             if (e == null) {
                 break;
             }
 
-            ctx.write(e.getKey(), e.getValue());
+            ch.write(e.getKey(), e.getValue());
         }
     }
 
     @Override
-    protected ChannelFuture doWriteReset(ChannelHandlerContext ctx, int id, int streamId, Http2Error error) {
+    protected ChannelFuture doWriteReset(int id, int streamId, Http2Error error) {
         // NB: this.minClosedId can be overwritten more than once when 3+ pipelined requests are received
         //     and they are handled by different threads simultaneously.
         //     e.g. when the 3rd request triggers a reset and then the 2nd one triggers another.
@@ -466,7 +484,7 @@ public final class Http1ObjectEncoder extends HttpObjectEncoder {
             }
         }
 
-        final ChannelFuture f = ctx.write(Unpooled.EMPTY_BUFFER);
+        final ChannelFuture f = ch.write(Unpooled.EMPTY_BUFFER);
         if (currentId >= minClosedId) {
             f.addListener(ChannelFutureListener.CLOSE);
         }

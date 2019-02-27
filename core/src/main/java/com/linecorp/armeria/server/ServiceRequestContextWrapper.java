@@ -16,10 +16,13 @@
 
 package com.linecorp.armeria.server;
 
+import java.net.InetAddress;
+import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 
+import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
@@ -45,6 +48,23 @@ public class ServiceRequestContextWrapper
      */
     protected ServiceRequestContextWrapper(ServiceRequestContext delegate) {
         super(delegate);
+    }
+
+    @Nonnull
+    @Override
+    public <A extends SocketAddress> A remoteAddress() {
+        return delegate().remoteAddress();
+    }
+
+    @Nonnull
+    @Override
+    public <A extends SocketAddress> A localAddress() {
+        return delegate().localAddress();
+    }
+
+    @Override
+    public InetAddress clientAddress() {
+        return delegate().clientAddress();
     }
 
     @Override
@@ -95,6 +115,11 @@ public class ServiceRequestContextWrapper
     @Override
     public String mappedPath() {
         return delegate().mappedPath();
+    }
+
+    @Override
+    public String decodedMappedPath() {
+        return delegate().decodedMappedPath();
     }
 
     @Nullable
@@ -166,6 +191,36 @@ public class ServiceRequestContextWrapper
     @Override
     public boolean removeAdditionalResponseHeader(AsciiString name) {
         return delegate().removeAdditionalResponseHeader(name);
+    }
+
+    @Override
+    public HttpHeaders additionalResponseTrailers() {
+        return delegate().additionalResponseTrailers();
+    }
+
+    @Override
+    public void setAdditionalResponseTrailer(AsciiString name, String value) {
+        delegate().setAdditionalResponseTrailer(name, value);
+    }
+
+    @Override
+    public void setAdditionalResponseTrailers(Headers<? extends AsciiString, ? extends String, ?> headers) {
+        delegate().setAdditionalResponseTrailers(headers);
+    }
+
+    @Override
+    public void addAdditionalResponseTrailer(AsciiString name, String value) {
+        delegate().addAdditionalResponseTrailer(name, value);
+    }
+
+    @Override
+    public void addAdditionalResponseTrailers(Headers<? extends AsciiString, ? extends String, ?> headers) {
+        delegate().addAdditionalResponseTrailers(headers);
+    }
+
+    @Override
+    public boolean removeAdditionalResponseTrailer(AsciiString name) {
+        return delegate().removeAdditionalResponseTrailer(name);
     }
 
     @Nullable

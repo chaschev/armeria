@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableList;
 import com.linecorp.armeria.client.Clients;
 import com.linecorp.armeria.client.HttpClient;
 import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
@@ -63,8 +64,6 @@ import com.linecorp.armeria.server.thrift.THttpService;
 import com.linecorp.armeria.spring.ArmeriaAutoConfigurationTest.TestConfiguration;
 import com.linecorp.armeria.spring.test.thrift.main.HelloService;
 import com.linecorp.armeria.spring.test.thrift.main.HelloService.hello_args;
-
-import io.netty.util.AsciiString;
 
 /**
  * This uses {@link ArmeriaAutoConfiguration} for integration tests.
@@ -109,7 +108,7 @@ public class ArmeriaAutoConfigurationTest {
                     .setDecorators(ImmutableList.of(LoggingService.newDecorator()))
                     .setExampleRequests(Collections.singleton(new hello_args("nameVal")))
                     .setExampleHeaders(Collections.singleton(HttpHeaders.of(
-                            AsciiString.of("x-additional-header"), "headerVal")));
+                            HttpHeaderNames.of("x-additional-header"), "headerVal")));
         }
     }
 
@@ -133,8 +132,10 @@ public class ArmeriaAutoConfigurationTest {
 
     public static class StringResponseConverter implements ResponseConverterFunction {
         @Override
-        public HttpResponse convertResponse(ServiceRequestContext ctx, @Nullable Object result)
-                throws Exception {
+        public HttpResponse convertResponse(ServiceRequestContext ctx,
+                                            HttpHeaders headers,
+                                            @Nullable Object result,
+                                            HttpHeaders trailingHeaders) throws Exception {
             if (result instanceof String) {
                 return HttpResponse.of(HttpStatus.OK,
                                        MediaType.ANY_TEXT_TYPE,
@@ -176,7 +177,7 @@ public class ArmeriaAutoConfigurationTest {
 
         final AggregatedHttpMessage msg = response.aggregate().get();
         assertThat(msg.status()).isEqualTo(HttpStatus.OK);
-        assertThat(msg.content().toStringUtf8()).isEqualTo("ok");
+        assertThat(msg.contentUtf8()).isEqualTo("ok");
     }
 
     @Test
@@ -187,12 +188,12 @@ public class ArmeriaAutoConfigurationTest {
 
         AggregatedHttpMessage msg = response.aggregate().get();
         assertThat(msg.status()).isEqualTo(HttpStatus.OK);
-        assertThat(msg.content().toStringUtf8()).isEqualTo("annotated");
+        assertThat(msg.contentUtf8()).isEqualTo("annotated");
 
         response = client.get("/annotated/get/2");
         msg = response.aggregate().get();
         assertThat(msg.status()).isEqualTo(HttpStatus.OK);
-        assertThat(msg.content().toStringUtf8()).isEqualTo("exception");
+        assertThat(msg.contentUtf8()).isEqualTo("exception");
     }
 
     @Test
@@ -207,8 +208,8 @@ public class ArmeriaAutoConfigurationTest {
 
         final AggregatedHttpMessage msg = response.aggregate().get();
         assertThat(msg.status()).isEqualTo(HttpStatus.OK);
-        assertThatJson(msg.content().toStringUtf8())
-                .node("services[0].exampleHttpHeaders[0].x-additional-header").isStringEqualTo("headerVal");
+        assertThatJson(msg.contentUtf8())
+                .node("services[1].exampleHttpHeaders[0].x-additional-header").isStringEqualTo("headerVal");
     }
 
     @Test
@@ -224,7 +225,7 @@ public class ArmeriaAutoConfigurationTest {
         final String metricReport = HttpClient.of(newUrl("http"))
                                               .get("/internal/metrics")
                                               .aggregate().join()
-                                              .content().toStringUtf8();
+                                              .contentUtf8();
         assertThat(metricReport).contains("# TYPE jvm_gc_live_data_size_bytes gauge");
     }
 }

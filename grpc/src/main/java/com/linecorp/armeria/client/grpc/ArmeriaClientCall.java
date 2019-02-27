@@ -37,12 +37,12 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpRequestWriter;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.SerializationFormat;
+import com.linecorp.armeria.common.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageDeframer.ByteBufOrStream;
 import com.linecorp.armeria.internal.grpc.ArmeriaMessageFramer;
-import com.linecorp.armeria.internal.grpc.GrpcHeaderNames;
 import com.linecorp.armeria.internal.grpc.GrpcLogUtil;
 import com.linecorp.armeria.internal.grpc.GrpcMessageMarshaller;
 import com.linecorp.armeria.internal.grpc.HttpStreamReader;
@@ -136,11 +136,12 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
                 new ArmeriaMessageDeframer(this, maxInboundMessageSizeBytes, ctx.alloc()),
                 this);
         executor = callOptions.getExecutor();
-        req.completionFuture().whenComplete((unused1, unused2) -> {
+        req.completionFuture().handle((unused1, unused2) -> {
             if (!ctx.log().isAvailable(RequestLogAvailability.REQUEST_CONTENT)) {
                 // Can reach here if the request stream was empty.
                 ctx.logBuilder().requestContent(GrpcLogUtil.rpcRequest(method), null);
             }
+            return null;
         });
     }
 
@@ -164,14 +165,14 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
         prepareHeaders(req.headers(), compressor);
         listener = responseListener;
         final HttpResponse res;
-        try {
+        try (SafeCloseable ignored = ctx.push()) {
             res = httpClient.execute(ctx, req);
         } catch (Exception e) {
             close(Status.fromThrowable(e));
             return;
         }
         res.subscribe(responseReader, ctx.eventLoop(), true);
-        res.completionFuture().whenCompleteAsync(responseReader, ctx.eventLoop());
+        res.completionFuture().handleAsync(responseReader, ctx.eventLoop());
     }
 
     @Override
@@ -245,7 +246,7 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
             req.write(messageFramer.writePayload(serialized));
             req.onDemand(() -> {
                 if (pendingMessagesUpdater.decrementAndGet(this) == 0) {
-                    try {
+                    try (SafeCloseable ignored = ctx.push()) {
                         listener.onReady();
                     } catch (Throwable t) {
                         close(Status.fromThrowable(t));
@@ -306,11 +307,14 @@ class ArmeriaClientCall<I, O> extends ClientCall<I, O>
     }
 
     private void close(Status status) {
+        ctx.logBuilder().responseContent(GrpcLogUtil.rpcResponse(status, firstResponse), null);
+        req.abort();
         responseReader.cancel();
+
         try (SafeCloseable ignored = ctx.push()) {
             listener.onClose(status, EMPTY_METADATA);
         }
-        ctx.logBuilder().responseContent(GrpcLogUtil.rpcResponse(status, firstResponse), null);
+
         notifyExecutor();
     }
 

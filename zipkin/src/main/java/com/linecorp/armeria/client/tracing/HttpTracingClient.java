@@ -16,12 +16,16 @@
 
 package com.linecorp.armeria.client.tracing;
 
+import static com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext.ensureScopeUsesRequestContext;
+
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.function.Function;
 
 import javax.annotation.Nullable;
+
+import com.google.common.base.Strings;
 
 import com.linecorp.armeria.client.Client;
 import com.linecorp.armeria.client.ClientRequestContext;
@@ -31,8 +35,10 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.logging.RequestLog;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
+import com.linecorp.armeria.common.tracing.RequestContextCurrentTraceContext;
 import com.linecorp.armeria.internal.tracing.AsciiStringKeyFactory;
 import com.linecorp.armeria.internal.tracing.SpanContextUtil;
+import com.linecorp.armeria.internal.tracing.SpanTags;
 
 import brave.Span;
 import brave.Span.Kind;
@@ -40,8 +46,6 @@ import brave.Tracer;
 import brave.Tracer.SpanInScope;
 import brave.Tracing;
 import brave.propagation.TraceContext;
-import io.netty.util.concurrent.FastThreadLocal;
-import zipkin2.Endpoint;
 
 /**
  * Decorates a {@link Client} to trace outbound {@link HttpRequest}s using
@@ -51,8 +55,6 @@ import zipkin2.Endpoint;
  * correspond to <a href="http://zipkin.io/">Zipkin</a>.
  */
 public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpResponse> {
-
-    private static final FastThreadLocal<SpanInScope> SPAN_IN_THREAD = new FastThreadLocal<>();
 
     /**
      * Creates a new tracing {@link Client} decorator using the specified {@link Tracing} instance.
@@ -68,6 +70,7 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
     public static Function<Client<HttpRequest, HttpResponse>, HttpTracingClient> newDecorator(
             Tracing tracing,
             @Nullable String remoteServiceName) {
+        ensureScopeUsesRequestContext(tracing);
         return delegate -> new HttpTracingClient(delegate, tracing, remoteServiceName);
     }
 
@@ -98,11 +101,18 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
         }
 
         final String method = ctx.method().name();
-        span.kind(Kind.CLIENT).name(method).start();
+        span.kind(Kind.CLIENT).name(method);
+        ctx.log().addListener(log -> SpanContextUtil.startSpan(span, log),
+                              RequestLogAvailability.REQUEST_START);
 
-        SpanContextUtil.setupContext(SPAN_IN_THREAD, ctx, span, tracer);
+        // Ensure the trace context propagates to children
+        ctx.onChild(RequestContextCurrentTraceContext::copy);
 
-        ctx.log().addListener(log -> finishSpan(span, log), RequestLogAvailability.COMPLETE);
+        ctx.log().addListener(log -> {
+            SpanTags.logWireSend(span, log.requestFirstBytesTransferredTimeNanos(), log);
+            SpanTags.logWireReceive(span, log.responseFirstBytesTransferredTimeNanos(), log);
+            finishSpan(span, log);
+        }, RequestLogAvailability.COMPLETE);
 
         try (SpanInScope ignored = tracer.withSpanInScope(span)) {
             return delegate().execute(ctx, req);
@@ -118,10 +128,14 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
 
         final SocketAddress remoteAddress = log.context().remoteAddress();
         final InetAddress address;
+        final int port;
         if (remoteAddress instanceof InetSocketAddress) {
-            address = ((InetSocketAddress) remoteAddress).getAddress();
+            final InetSocketAddress socketAddress = (InetSocketAddress) remoteAddress;
+            address = socketAddress.getAddress();
+            port = socketAddress.getPort();
         } else {
             address = null;
+            port = 0;
         }
 
         final String remoteServiceName;
@@ -138,10 +152,11 @@ public class HttpTracingClient extends SimpleDecoratingClient<HttpRequest, HttpR
             }
         }
 
-        if (remoteServiceName == null && address == null) {
-            return;
+        if (!Strings.isNullOrEmpty(remoteServiceName)) {
+            span.remoteServiceName(remoteServiceName);
         }
-
-        span.remoteEndpoint(Endpoint.newBuilder().serviceName(remoteServiceName).ip(address).build());
+        if (address != null) {
+            span.remoteIpAndPort(address.getHostAddress(), port);
+        }
     }
 }

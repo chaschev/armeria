@@ -97,9 +97,9 @@ using :api:`ServerBuilder`. You may use one of the pre-defined log formats.
 
     ServerBuilder sb = new ServerBuilder();
     // Use NCSA common log format.
-    sb.accessLogWriter(AccessLogWriters.common());
+    sb.accessLogWriter(AccessLogWriter.common(), true);
     // Use NCSA combined log format.
-    sb.accessLogWriter(AccessLogWriters.combined());
+    sb.accessLogWriter(AccessLogWriter.combined(), true);
     // Use your own log format.
     sb.accessLogFormat("...log format...");
     ...
@@ -120,6 +120,14 @@ Tokens for the log format are listed in the following table.
 +---------------------------+-------------------+----------------------------------------------------+
 | Tokens                    | Condition support | Description                                        |
 +===========================+===================+====================================================+
+| ``%A``                    | No                | the local IP address                               |
++---------------------------+-------------------+----------------------------------------------------+
+| ``%a``                    | No                | the IP address of the client who initiated a       |
+|                           |                   | request. Use ``%{c}a`` format string to get the    |
+|                           |                   | remote IP address where the channel is connected   |
+|                           |                   | to, which may yield a different value when there   |
+|                           |                   | is an intermediary proxy server.                   |
++---------------------------+-------------------+----------------------------------------------------+
 | ``%h``                    | No                | the remote hostname or IP address if DNS           |
 |                           |                   | hostname lookup is not available                   |
 +---------------------------+-------------------+----------------------------------------------------+
@@ -206,6 +214,8 @@ supported variable:
 | ``requestCause``              | the cause of request processing failure. The class name of the     |
 |                               | cause and the detail message of it will be contained if exists.    |
 +-------------------------------+--------------------------------------------------------------------+
+| ``requestContentPreview``     | the preview of the request content                                 |
++-------------------------------+--------------------------------------------------------------------+
 | ``responseStartTimeMillis``   | the time when the processing of the response started,              |
 |                               | in milliseconds since the epoch                                    |
 +-------------------------------+--------------------------------------------------------------------+
@@ -219,6 +229,8 @@ supported variable:
 +-------------------------------+--------------------------------------------------------------------+
 | ``responseCause``             | the cause of response processing failure. The class name of the    |
 |                               | cause and the detail message of it will be contained if exists.    |
++-------------------------------+--------------------------------------------------------------------+
+| ``responseContentPreview``    | the preview of the response content                                |
 +-------------------------------+--------------------------------------------------------------------+
 | ``totalDurationMillis``       | the amount of time taken since the request processing started and  |
 |                               | until the response processing ended, in milliseconds               |
@@ -237,7 +249,7 @@ supported variable:
 | ``host``                      | the host name of the request                                       |
 +-------------------------------+--------------------------------------------------------------------+
 | ``status``                    | the status code and its reason phrase of the response.             |
-|                               | e.g. ``200 Ok``                                                    |
+|                               | e.g. ``200 OK``                                                    |
 +-------------------------------+--------------------------------------------------------------------+
 | ``statusCode``                | the status code of the response. e.g. ``200``                      |
 +-------------------------------+--------------------------------------------------------------------+
@@ -297,4 +309,64 @@ You can specify your own log writer which implements a ``Consumer`` of :api:`Req
     sb.accessLogWriter(requestLog -> {
         // Write your access log with the given RequestLog instance.
         ....
+    }, true);
+
+
+Customizing an access logger
+----------------------------
+
+Armeria uses an SLF4J logger whose name is based on a reversed domain name of each virtual host by
+default, e.g.
+
+- ``com.linecorp.armeria.logging.access.com.example`` for ``*.example.com``
+- ``com.linecorp.armeria.logging.access.com.linecorp`` for ``*.linecorp.com``
+
+Alternatively, you can specify your own mapper or logger for a :api:`VirtualHost`, e.g.
+
+.. code-block:: java
+
+    ServerBuilder sb = new ServerBuilder();
+
+    // Using the specific logger name.
+    sb.accessLogger("com.example.my.access.logs");
+    ....
+
+    // Using your own logger.
+    Logger logger = LoggerFactory.getLogger("com.example2.my.access.logs");
+    sb.accessLogger(Logger);
+    ....
+
+    // Using the mapper which sets an access logger with the given VirtualHost instance.
+    sb.accessLogger(virtualHost -> {
+        // Return the logger.
+        // Do not return null. Otherwise, it will raise an IllegalStateException.
+        return LoggerFactory.getLogger("com.example.my.access.logs." + virtualHost.defaultHostname());
     });
+    ....
+
+You can also specify your own logger for the specific :api:`VirtualHost`.
+In this case, the mapper or logger you set for a specific :api:`VirtualHost` will override the access logger set via ``ServerBuilder.accessLogger()``.
+
+.. code-block:: java
+
+    // Using the specific logger name.
+    sb.withVirtualHost("*.example.com")
+      .accessLogger("com.example.my.access.logs")
+      .and()
+    ....
+
+    // Using your own logger.
+    Logger logger = LoggerFactory.getLogger("com.example2.my.access.logs");
+    sb.withVirtualHost("*.example2.com")
+      .accessLogger(Logger)
+      .and()
+    ....
+
+    // Using the mapper which sets an access logger with the given VirtualHost instance.
+    sb.withVirtualHost("*.example3.com")
+      .accessLogger(virtualHost -> {
+        // Return the logger.
+        // Do not return null. Otherwise, it will raise an IllegalStateException.
+        return LoggerFactory.getLogger("com.example.my.access.logs." + virtualHost.defaultHostname());
+      })
+    ....

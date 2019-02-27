@@ -1,12 +1,18 @@
+.. _Publisher: https://www.reactive-streams.org/reactive-streams-1.0.2-javadoc/org/reactivestreams/Publisher.html
+
 .. _server-annotated-service:
 
-Annotated HTTP Service
-======================
+Annotated services
+==================
+
+.. note::
+
+    Visit `armeria-examples <https://github.com/line/armeria-examples>`_ to find a fully working example.
 
 Armeria provides a way to write an HTTP service using annotations. It helps a user make his or her code
 simple and easy to understand. A user is able to run an HTTP service by fewer lines of code using
 annotations as follows. ``hello()`` method in the example would be mapped to the path of ``/hello/{name}``
-with an HTTP GET method.
+with an HTTP ``GET`` method.
 
 .. code-block:: java
 
@@ -101,6 +107,28 @@ a path and use the HTTP method annotations without a path to map multiple HTTP m
         @Delete
         @Path("/hello")
         public HttpResponse hello() { ... }
+    }
+
+Every service method assumes that it returns an HTTP response with ``200 OK`` or ``204 No Content`` status
+according to its return type. If the return type is ``void`` or ``Void``, ``204 No Content`` would be applied.
+``200 OK`` would be applied for the other types. If you want to return an alternative status code for a method,
+you can use :api:`@StatusCode` annotation as follows.
+
+.. code-block:: java
+
+    public class MyAnnotatedService {
+
+        @StatusCode(201)
+        @Post("/users/{name}")
+        public User createUser(@Param("name") String name) { ... }
+
+        // @StatusCode(200) would be applied by default.
+        @Get("/users/{name}")
+        public User getUser(@Param("name") String name) { ... }
+
+        // @StatusCode(204) would be applied by default.
+        @Delete("/users/{name}")
+        public void deleteUser(@Param("name") String name) { ... }
     }
 
 .. _parameter-injection:
@@ -220,7 +248,7 @@ Getting an HTTP parameter
 
 When the value of :api:`@Param` annotation is not shown in the path pattern, it will be handled as a
 parameter name of the query string of the request. If you have a service class like the example below and
-a user sends an HTTP GET request with URI of ``/hello1?name=armeria``, the service method will get ``armeria``
+a user sends an HTTP ``GET`` request with URI of ``/hello1?name=armeria``, the service method will get ``armeria``
 as the value of parameter ``name``. If there is no parameter named ``name`` in the query string, the parameter
 ``name`` of the method would be ``null``. If you want to avoid ``null`` in this case, you can use
 :api:`@Default` annotation or ``Optional<?>`` class, e.g. ``hello2`` and ``hello3`` methods below, respectively.
@@ -261,7 +289,7 @@ or ``Optional<?>`` class here, too.
         public HttpResponse hello3(@Param("number") Optional<List<Integer>> numbers) { ... }
     }
 
-If an HTTP POST request with a ``Content-Type: x-www-form-urlencoded`` is received and no :api:`@Param`
+If an HTTP ``POST`` request with a ``Content-Type: x-www-form-urlencoded`` is received and no :api:`@Param`
 value appears in the path pattern, Armeria will aggregate the received request and decode its body as
 a URL-encoded form. After that, Armeria will inject the decoded value into the parameter.
 
@@ -424,39 +452,55 @@ converter is not able to convert the request.
 
 .. code-block:: java
 
-    public class MyRequestConverter implements RequestConverterFunction {
+    public class ToEnglishConverter implements RequestConverterFunction {
         @Override
         public Object convertRequest(ServiceRequestContext ctx, AggregatedHttpMessage request,
                                      Class<?> expectedResultType) {
-            if (expectedResultType == MyObject.class) {
+            if (expectedResultType == Greeting.class) {
                 // Convert the request to a Java object.
-                return new MyObject(request.content());
+                return new Greeting(translateToEnglish(request.contentUtf8()));
             }
 
             // To the next request converter.
             return RequestConverterFunction.fallthrough();
         }
+
+        private String translateToEnglish(String greetingInAnyLanguage) { ... }
     }
 
-Then, you can write your service method as follows. Note that a request converter will work on the parameters
-which are annotated with :api:`@RequestObject`.
+Then, you can write your service method as follows. Custom request objects will be converted automatically
+by the converters you registered with :api:`@RequestConverter` annotation. Note that :api:`@RequestConverter`
+annotation can be specified on a class, a method or a parameter in an annotated service, and its scope
+is determined depending on where it is specified.
 
 .. code-block:: java
 
-    @RequestConverter(MyRequestConverter.class)
+    @RequestConverter(ToEnglishConverter.class)
     public class MyAnnotatedService {
 
         @Post("/hello")
-        public HttpResponse hello(@RequestObject MyObject myObject) {
-            // MyRequestConverter will be used to convert a request.
+        public HttpResponse hello(Greeting greeting) {
+            // ToEnglishConverter will be used to convert a request.
             // ...
         }
 
         @Post("/hola")
-        @RequestConverter(MySpanishRequestConverter.class)
-        public HttpResponse hola(@RequestObject MySpanishObject myObject) {
-            // MySpanishRequestConverter will be tried to convert a request first.
-            // MyRequestConverter will be used if MySpanishRequestConverter fell through.
+        @RequestConverter(ToSpanishConverter.class)
+        public HttpResponse hola(Greeting greeting) {
+            // ToSpanishConverter will be tried to convert a request first.
+            // ToEnglishConverter will be used if ToSpanishConverter fell through.
+            // ...
+        }
+
+        @Post("/greet")
+        public HttpResponse greet(RequestConverter(ToGermanConverter.class) Greeting greetingInGerman,
+                                  Greeting greetingInEnglish) {
+            // For the 1st parameter 'greetingInGerman':
+            // ToGermanConverter will be tried to convert a request first.
+            // ToEnglishConverter will be used if ToGermanConverter fell through.
+            //
+            // For the 2nd parameter 'greetingInEnglish':
+            // ToEnglishConverter will be used to convert a request.
             // ...
         }
     }
@@ -464,42 +508,54 @@ which are annotated with :api:`@RequestObject`.
 Armeria also provides built-in request converters such as, a request converter for a Java Bean,
 :api:`JacksonRequestConverterFunction` for a JSON document, :api:`StringRequestConverterFunction`
 for a string and :api:`ByteArrayRequestConverterFunction` for binary data. They will be applied
-after your request converters by default, so you can use these built-in converters by just putting
-:api:`@RequestObject` annotation on the parameters which you want to convert.
-
-In some cases, :api:`@RequestObject` annotation may have a request converter as its value.
-Assume that you have a Java class named ``MyRequest`` that it is usually able to be converted by
-``MyDefaultRequestConverter``. But what if there is only one method which has a parameter of ``MyRequest``
-that you have to convert it differently? In this case, you may specify a request converter with
-:api:`@RequestObject` annotation. In the example, ``MySpecialRequestConverter`` will be used first for
-converting ``MyRequest``.
+after your request converters, so you don't have to specify any :api:`@RequestConverter` annotations:
 
 .. code-block:: java
 
-    @RequestConverter(MyDefaultRequestConverter.class)
     public class MyAnnotatedService {
-        @Post("/hello")
-        public HttpResponse hello(
-            @RequestObject(MySpecialRequestConverter.class) MyRequest myRequest) { ... }
-    }
 
+        // JacksonRequestConverterFunction will work for the content type of 'application/json' or
+        // one of '+json' types.
+        @Post("/hello1")
+        public HttpResponse hello1(JsonNode body) { ... }
+
+        @Post("/hello2")
+        public HttpResponse hello2(MyJsonRequest body) { ... }
+
+        // StringRequestConverterFunction will work for the content type of any of 'text'.
+        @Post("/hello3")
+        public HttpResponse hello3(String body) { ... }
+
+        @Post("/hello4")
+        public HttpResponse hello4(CharSequence body) { ... }
+
+        // ByteArrayRequestConverterFunction will work for the content type of 'application/octet-stream',
+        // 'application/binary' or none.
+        @Post("/hello5")
+        public HttpResponse hello5(byte[] body) { ... }
+
+        @Post("/hello6")
+        public HttpResponse hello6(HttpData body) { ... }
+    }
 
 Injecting value of parameters and HTTP headers into a Java object
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
-Armeria provides a generic built-in request converter for Java objects which is activated by
-putting :api:`@RequestObject` annotation on the parameters which you want to convert.
+Armeria provides a generic built-in request converter that converts a request into a Java object.
+Just define a plain old Java class and specify it as a parameter of your service method.
 
 .. code-block:: java
 
     public class MyAnnotatedService {
         @Post("/hello")
-        public HttpResponse hello(@RequestObject MyRequestObject myRequestObject) { ... }
+        public HttpResponse hello(MyRequestObject myRequestObject) { ... }
     }
 
-Besides the annotated service class, you also need to create ``MyRequestObject`` and put :api:`@Param` or
-:api:`@Header` annotations on any of the following elements, to inject the path parameters, HTTP parameters
-or HTTP headers:
+
+
+We also need to define the ``MyRequestObject`` class which was used in the method ``hello()`` above.
+To tell Armeria which constructor parameter, setter method or field has to be injected with what value,
+we should put :api:`@Param`, :api:`@Header`, :api:`@RequestObject` annotations on any of the following elements:
 
 - Fields
 - Constructors with only one parameter
@@ -544,6 +600,7 @@ using them on the parameters of a service method because even you can use :api:`
 :api:`@RequestObject` annotations defined there.
 Please refer to :ref:`parameter-injection`, and :ref:`header-injection` for more information.
 
+.. _response_converter:
 
 Converting a Java object to an HTTP response
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -559,7 +616,10 @@ convert the result to an :api:`HttpResponse`.
 
     public class MyResponseConverter implements ResponseConverterFunction {
         @Override
-        public HttpResponse convertResponse(ServiceRequestContext ctx, Object result) {
+        HttpResponse convertResponse(ServiceRequestContext ctx,
+                                     HttpHeaders headers,
+                                     @Nullable Object result,
+                                     HttpHeaders trailingHeaders) throws Exception {
             if (result instanceof MyObject) {
                 return HttpResponse.of(HttpStatus.OK,
                                        MediaType.PLAIN_TEXT_UTF_8,
@@ -601,7 +661,10 @@ as follows.
 
     public class MyResponseConverter implements ResponseConverterFunction {
         @Override
-        public HttpResponse convertResponse(ServiceRequestContext ctx, Object result)  {
+        HttpResponse convertResponse(ServiceRequestContext ctx,
+                                     HttpHeaders headers,
+                                     @Nullable Object result,
+                                     HttpHeaders trailingHeaders) throws Exception {
             MediaType mediaType = ctx.negotiatedResponseMediaType();
             if (mediaType != null) {
                 // Do something based on the media type.
@@ -640,7 +703,7 @@ Let's see the following example about the default response conversion.
 
         // JacksonResponseConverterFunction will convert the return values to JSON documents:
         @Get("/json1")
-        @ProduceJson    // the same as @Produces("application/json; charset=utf-8")
+        @ProducesJson    // the same as @Produces("application/json; charset=utf-8")
         public MyObject json1() { ... }
 
         @Get("/json2")
@@ -648,7 +711,7 @@ Let's see the following example about the default response conversion.
 
         // StringResponseConverterFunction will convert the return values to strings:
         @Get("/string1")
-        @ProduceText    // the same as @Produces("text/plain; charset=utf-8")
+        @ProducesText    // the same as @Produces("text/plain; charset=utf-8")
         public int string1() { ... }
 
         @Get("/string2")
@@ -656,7 +719,7 @@ Let's see the following example about the default response conversion.
 
         // ByteArrayResponseConverterFunction will convert the return values to byte arrays:
         @Get("/byte1")
-        @ProduceBinary  // the same as @Produces("application/binary")
+        @ProducesBinary  // the same as @Produces("application/binary")
         public HttpData byte1() { ... }
 
         @Get("/byte2")
@@ -689,7 +752,10 @@ in a single class and add it to your :api:`ServerBuilder` at once, e.g.
                                      Class<?> expectedResultType) { ... }
 
         @Override
-        public HttpResponse convertResponse(ServiceRequestContext ctx, Object result) { ... }
+        HttpResponse convertResponse(ServiceRequestContext ctx,
+                                     HttpHeaders headers,
+                                     @Nullable Object result,
+                                     HttpHeaders trailingHeaders) throws Exception { ... }
 
         @Override
         public HttpResponse handleException(RequestContext ctx, HttpRequest req,
@@ -719,6 +785,56 @@ order commented. It is also the same as the evaluation order of the converters.
     sb.annotatedService(new MyAnnotatedService(),
                         new MyGlobalExceptionHandler5(),        // order 5
                         new MyGlobalExceptionHandler6());       // order 6
+
+Returning a response
+--------------------
+
+In the earlier examples, the annotated service methods only return :api:`HttpResponse`, however there are
+more response types which can be used in the annotated service.
+
+- :api:`HttpResponse` and :api:`AggregatedHttpMessage`
+
+  - It will be sent to the client without any modification. If an exception is raised while the response is
+    being sent, exception handlers will handle it. If no message has been sent to the client yet,
+    the exception handler can send an :api:`HttpResponse` instead.
+
+- :api:`HttpResult`
+
+  - It contains the :api:`HttpHeaders` and the object which can be converted into HTTP response body by
+    response converters. A user can customize the HTTP status and headers including the trailing headers,
+    with this type.
+
+  .. code-block:: java
+
+      public class MyAnnotatedService {
+          @Get("/users")
+          public HttpResult<User> getUsers(@Param int start) {
+              List<User> users = ...;
+              HttpHeaders headers = HttpHeaders.of(HttpStatus.OK);
+              headers.add(HttpHeaderNames.LINK,
+                          String.format("<https://example.com/users?start=%s>; rel=\"next\"", start + 10));
+              return HttpResult.of(headers, users);
+          }
+
+- Reactive Streams Publisher_
+
+  - All objects which are produced by the publisher will be collected, then the collected ones will be
+    converted to an :api:`HttpResponse` by response converters. If a single object is produced, it will be
+    passed into the response converters as it is. But if multiple objects are produced, they will be passed
+    into the response converters as a list. If the producer produces an error, exception handlers will handle it.
+    Note that RxJava `ObservableSource <http://reactivex.io/RxJava/javadoc/io/reactivex/ObservableSource.html>`_
+    will be treated in the same way as Publisher_ if you add ``armeria-rxjava`` to the dependencies.
+
+- ``CompletionStage`` and ``CompletableFuture``
+
+  - An object which is generated by the ``CompletionStage`` will be converted to an :api:`HttpResponse`
+    by response converters. If the ``CompletionStage`` completes exceptionally, exception handlers will
+    handle the cause.
+
+- Other types
+
+  - As described in :ref:`response_converter`, you can use any response types with response converters
+    that convert them. If a service method raises an exception, exception handlers will handle it.
 
 Decorating an annotated service
 -------------------------------
@@ -1031,13 +1147,13 @@ You can annotate them with :api:`@Consumes` annotation.
         @Post("/hello")
         @Consumes("text/plain")
         public HttpResponse helloText(AggregatedHttpMessage message) {
-            // Get a text content by calling message.content().toStringAscii().
+            // Get a text content by calling message.contentAscii().
         }
 
         @Post("/hello")
         @Consumes("application/json")
         public HttpResponse helloJson(AggregatedHttpMessage message) {
-            // Get a JSON object by calling message.content().toStringUtf8().
+            // Get a JSON object by calling message.contentUtf8().
         }
     }
 
@@ -1079,7 +1195,7 @@ as follows. ``helloCatchAll()`` method would accept every request except for the
         @Post("/hello")
         @Consumes("application/json")
         public HttpResponse helloJson(AggregatedHttpMessage message) {
-            // Get a JSON object by calling message.content().toStringUtf8().
+            // Get a JSON object by calling message.contentUtf8().
         }
     }
 
@@ -1117,5 +1233,114 @@ Then, you can annotate your service method with your annotation as follows.
         @Post("/hello")
         @MyConsumableType  // the same as @Consumes("application/xml")
         @MyProducibleType  // the same as @Produces("application/xml")
-        public MyResponse hello(@RequestObject MyRequest myRequest) { ... }
+        public MyResponse hello(MyRequest myRequest) { ... }
+    }
+
+
+Specifying additional response headers/trailers
+-----------------------------------------------
+
+Armeria provides a way to configure additional headers/trailers via annotation,
+:api:`@AdditionalHeader` for HTTP headers and :api:`@AdditionalTrailer` for HTTP trailers.
+
+You can annotate your service method with the annotations as follows.
+
+.. code-block:: java
+
+    import com.linecorp.armeria.server.annotation.AdditionalHeader;
+    import com.linecorp.armeria.server.annotation.AdditionalTrailer;
+
+    @AdditionalHeader(name = "custom-header", value = "custom-value")
+    @AdditionalTrailer(name = "custom-trailer", value = "custom-value")
+    public class MyAnnotatedService {
+        @Get("/hello")
+        @AdditionalHeader(name = "custom-header-2", value = "custom-value")
+        @AdditionalTrailer(name = "custom-trailer-2", value = "custom-value")
+        public HttpResponse hello() { ... }
+    }
+
+The :api:`@AdditionalHeader` or :api:`@AdditionalTrailer` specified at the method level takes precedence over
+what's specified at the class level if it has the same name, e.g.
+
+.. code-block:: java
+
+    @AdditionalHeader(name = "custom-header", value = "custom-value")
+    @AdditionalTrailer(name = "custom-trailer", value = "custom-value")
+    public class MyAnnotatedService {
+        @Get("/hello")
+        @AdditionalHeader(name = "custom-header", value = "custom-overwritten")
+        @AdditionalTrailer(name = "custom-trailer", value = "custom-overwritten")
+        public HttpResponse hello() { ... }
+    }
+
+In this case, the values of the HTTP header named ``custom-header`` and the HTTP trailer named
+``custom-trailer`` will be ``custom-overwritten``, not ``custom-value``.
+
+Note that the trailers will not be injected into the responses with the following HTTP status code,
+because they always have an empty content.
+
++--------------+----------------+
+| Status code  | Description    |
++==============+================+
+| 1xx          | Informational  |
++--------------+----------------+
+| 204          | No content     |
++--------------+----------------+
+| 205          | Reset content  |
++--------------+----------------+
+| 304          | Not modified   |
++--------------+----------------+
+
+Using a composite annotation
+----------------------------
+
+To avoid specifying a common set of annotations repetitively, you may want to create a composite annotation
+which is annotated by other annotations. For example, let's assume that there is a service class like the below:
+
+.. code-block:: java
+
+    public class MyAnnotatedService {
+
+        @Post("/create")
+        @ConsumesJson
+        @ProducesJson
+        @LoggingDecorator
+        @MyAuthenticationDecorator
+        public HttpResponse create() { ... }
+
+        @Post("/update")
+        @ConsumesJson
+        @ProducesJson
+        @LoggingDecorator
+        @MyAuthenticationDecorator
+        public HttpResponse update() { ... }
+    }
+
+In the above example, you had to add the same 4 annotations to the two different methods. It is obviously
+too verbose and duplicate, so we could simplify them by creating a composite annotation like the following:
+
+.. code-block:: java
+
+    @Retention(RetentionPolicy.RUNTIME)
+    @ConsumesJson
+    @ProducesJson
+    @LoggingDecorator
+    @MyAuthenticationDecorator
+    public @interface MyCreateOrUpdateApiSpec {}
+
+Now, let's rewrite the service class with the composite annotation. It is definitely less verbose than before.
+Moreover, you don't need to update both ``create()`` and ``update()`` but only ``MyCreateOrUpdateApiSpec``
+when you add more common annotations to them.
+
+.. code-block:: java
+
+    public class MyAnnotatedService {
+
+        @Post("/create")
+        @MyCreateOrUpdateApiSpec
+        public HttpResponse create() { ... }
+
+        @Post("/update")
+        @MyCreateOrUpdateApiSpec
+        public HttpResponse update() { ... }
     }

@@ -19,7 +19,6 @@ package com.linecorp.armeria.common.stream;
 import org.reactivestreams.Subscriber;
 
 import com.linecorp.armeria.common.Flags;
-import com.linecorp.armeria.common.util.Exceptions;
 
 /**
  * A {@link RuntimeException} that is raised to signal a {@link Subscriber} that the {@link StreamMessage}
@@ -29,16 +28,19 @@ public final class AbortedStreamException extends RuntimeException {
 
     private static final long serialVersionUID = -5271590540551141199L;
 
-    private static final AbortedStreamException INSTANCE =
-            Exceptions.clearTrace(new AbortedStreamException());
+    static final AbortedStreamException INSTANCE = new AbortedStreamException(false);
 
     /**
      * Returns a {@link AbortedStreamException} which may be a singleton or a new instance, depending on
-     * whether {@link Flags#verboseExceptions() the verbose exception mode} is enabled.
+     * whether {@linkplain Flags#verboseExceptions() the verbose exception mode} is enabled.
      */
     public static AbortedStreamException get() {
         return Flags.verboseExceptions() ? new AbortedStreamException() : INSTANCE;
     }
 
     private AbortedStreamException() {}
+
+    private AbortedStreamException(@SuppressWarnings("unused") boolean dummy) {
+        super(null, null, false, false);
+    }
 }

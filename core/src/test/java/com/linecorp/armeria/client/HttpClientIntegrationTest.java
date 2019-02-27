@@ -37,7 +37,6 @@ import org.junit.Test;
 import org.reactivestreams.Subscriber;
 import org.reactivestreams.Subscription;
 
-import com.google.common.base.Throwables;
 import com.google.common.io.ByteStreams;
 import com.google.common.io.Closeables;
 
@@ -60,6 +59,7 @@ import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.util.CompletionActions;
+import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.server.AbstractHttpService;
 import com.linecorp.armeria.server.ServerBuilder;
 import com.linecorp.armeria.server.Service;
@@ -188,7 +188,7 @@ public class HttpClientIntegrationTest {
                 }
 
                 private HttpResponse doGetOrPost(HttpRequest req) {
-                        final MediaType contentType = req.headers().contentType();
+                        final MediaType contentType = req.contentType();
                     if (contentType != null) {
                         throw new IllegalArgumentException(
                                 "Serialization format is none, so content type should not be set: " +
@@ -206,7 +206,7 @@ public class HttpClientIntegrationTest {
                         if (cause != null) {
                             return HttpResponse.of(
                                     HttpStatus.INTERNAL_SERVER_ERROR,
-                                    MediaType.PLAIN_TEXT_UTF_8, Throwables.getStackTraceAsString(cause));
+                                    MediaType.PLAIN_TEXT_UTF_8, Exceptions.traceText(cause));
                         }
 
                         return HttpResponse.of(
@@ -215,7 +215,7 @@ public class HttpClientIntegrationTest {
                                 HttpData.ofUtf8(
                                         "METHOD: %s|ACCEPT: %s|BODY: %s",
                                         req.method().name(), accept,
-                                        aReq.content().toString(StandardCharsets.UTF_8)));
+                                        aReq.contentUtf8()));
                     }).exceptionally(CompletionActions::log));
                 }
             });
@@ -300,6 +300,16 @@ public class HttpClientIntegrationTest {
                 }, ctx.eventLoop());
                 return res;
             });
+
+            sb.service("glob:/oneparam/**", ((ctx, req) -> {
+                // The client was able to send a request with an escaped path param. Armeria servers always
+                // decode the path so ctx.path == '/oneparam/foo/bar' here.
+                if (req.headers().path().equals("/oneparam/foo%2Fbar") &&
+                    ctx.path().equals("/oneparam/foo/bar")) {
+                    return HttpResponse.of("routed");
+                }
+                return HttpResponse.of(HttpStatus.INTERNAL_SERVER_ERROR);
+            }));
         }
     };
 
@@ -331,10 +341,9 @@ public class HttpClientIntegrationTest {
                 HttpHeaders.of(HttpMethod.GET, "/httptestbody")
                            .set(HttpHeaderNames.ACCEPT, "utf-8")).aggregate().get();
 
-        assertEquals(HttpStatus.OK, response.headers().status());
+        assertEquals(HttpStatus.OK, response.status());
         assertEquals("alwayscache", response.headers().get(HttpHeaderNames.CACHE_CONTROL));
-        assertEquals("METHOD: GET|ACCEPT: utf-8|BODY: ",
-                     response.content().toString(StandardCharsets.UTF_8));
+        assertEquals("METHOD: GET|ACCEPT: utf-8|BODY: ", response.contentUtf8());
     }
 
     @Test
@@ -346,10 +355,9 @@ public class HttpClientIntegrationTest {
                            .set(HttpHeaderNames.ACCEPT, "utf-8"),
                 "requestbody日本語").aggregate().get();
 
-        assertEquals(HttpStatus.OK, response.headers().status());
+        assertEquals(HttpStatus.OK, response.status());
         assertEquals("alwayscache", response.headers().get(HttpHeaderNames.CACHE_CONTROL));
-        assertEquals("METHOD: POST|ACCEPT: utf-8|BODY: requestbody日本語",
-                     response.content().toString(StandardCharsets.UTF_8));
+        assertEquals("METHOD: POST|ACCEPT: utf-8|BODY: requestbody日本語", response.contentUtf8());
     }
 
     @Test
@@ -375,7 +383,7 @@ public class HttpClientIntegrationTest {
 
             final AggregatedHttpMessage res = client.get("/hello/world").aggregate().join();
             assertThat(res.status()).isEqualTo(HttpStatus.OK);
-            assertThat(res.content().toStringUtf8()).isEqualTo("success");
+            assertThat(res.contentUtf8()).isEqualTo("success");
         } finally {
             EndpointGroupRegistry.unregister(groupName);
         }
@@ -387,26 +395,7 @@ public class HttpClientIntegrationTest {
 
         final AggregatedHttpMessage response = client.get("/not200").aggregate().get();
 
-        assertEquals(HttpStatus.NOT_FOUND, response.headers().status());
-    }
-
-    /**
-     * When the request path contains double slashes, they should be replaced with single slashes.
-     */
-    @Test
-    public void testDoubleSlashSuppression() throws Exception {
-        testDoubleSlashSuppression("/double//slashes", "/double/slashes");
-        // The double slashes in the query string should not be normalized.
-        testDoubleSlashSuppression("/double//slashes?slashed//query", "/double/slashes?slashed//query");
-    }
-
-    private static void testDoubleSlashSuppression(String path, String normalizedPath) throws IOException {
-        testSocketOutput(
-                path,
-                port -> "GET " + normalizedPath + " HTTP/1.1\r\n" +
-                        "host: 127.0.0.1:" + port + "\r\n" +
-                        "user-agent: " + HttpHeaderUtil.USER_AGENT + "\r\n\r\n"
-        );
+        assertEquals(HttpStatus.NOT_FOUND, response.status());
     }
 
     /**
@@ -445,7 +434,7 @@ public class HttpClientIntegrationTest {
 
         final AggregatedHttpMessage response = client.get(path).aggregate().get();
 
-        assertEquals(headerValue, response.content().toStringUtf8());
+        assertEquals(headerValue, response.contentUtf8());
     }
 
     private static void testHeaderOverridableByRequestHeader(String path, AsciiString headerName,
@@ -461,7 +450,7 @@ public class HttpClientIntegrationTest {
                                           .add(headerName, OVERRIDDEN_VALUE))
                       .aggregate().get();
 
-        assertEquals(OVERRIDDEN_VALUE, response.content().toStringUtf8());
+        assertEquals(OVERRIDDEN_VALUE, response.contentUtf8());
     }
 
     @Test
@@ -472,7 +461,7 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("gzip");
-        assertThat(response.content().toStringUtf8()).isEqualTo(
+        assertThat(response.contentUtf8()).isEqualTo(
                 "some content to compress more content to compress");
     }
 
@@ -485,7 +474,7 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isEqualTo("deflate");
-        assertThat(response.content().toStringUtf8()).isEqualTo(
+        assertThat(response.contentUtf8()).isEqualTo(
                 "some content to compress more content to compress");
     }
 
@@ -498,7 +487,7 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response =
                 client.execute(HttpHeaders.of(HttpMethod.GET, "/encoding-toosmall")).aggregate().get();
         assertThat(response.headers().get(HttpHeaderNames.CONTENT_ENCODING)).isNull();
-        assertThat(response.content().toStringUtf8()).isEqualTo("small content");
+        assertThat(response.contentUtf8()).isEqualTo("small content");
     }
 
     private static void testSocketOutput(String path,
@@ -538,7 +527,7 @@ public class HttpClientIntegrationTest {
 
         final AggregatedHttpMessage response = client.get("/world").aggregate().get();
 
-        assertEquals("success", response.content().toStringUtf8());
+        assertEquals("success", response.contentUtf8());
     }
 
     @Test
@@ -547,7 +536,7 @@ public class HttpClientIntegrationTest {
 
         final AggregatedHttpMessage response = client.get("/hello/world").aggregate().get();
 
-        assertEquals("success", response.content().toStringUtf8());
+        assertEquals("success", response.contentUtf8());
     }
 
     @Test
@@ -557,8 +546,8 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled")).aggregate().get();
 
-        assertEquals(HttpStatus.OK, response.headers().status());
-        assertThat(response.content().toStringUtf8()).isEqualTo("pooled content");
+        assertEquals(HttpStatus.OK, response.status());
+        assertThat(response.contentUtf8()).isEqualTo("pooled content");
         await().untilAsserted(() -> assertThat(releasedByteBuf.get().refCnt()).isZero());
     }
 
@@ -569,8 +558,8 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled-aware")).aggregate().get();
 
-        assertEquals(HttpStatus.OK, response.headers().status());
-        assertThat(response.content().toStringUtf8()).isEqualTo("pooled content");
+        assertEquals(HttpStatus.OK, response.status());
+        assertThat(response.contentUtf8()).isEqualTo("pooled content");
         await().untilAsserted(() -> assertThat(releasedByteBuf.get().refCnt()).isZero());
     }
 
@@ -581,8 +570,8 @@ public class HttpClientIntegrationTest {
         final AggregatedHttpMessage response = client.execute(
                 HttpHeaders.of(HttpMethod.GET, "/pooled-unaware")).aggregate().get();
 
-        assertEquals(HttpStatus.OK, response.headers().status());
-        assertThat(response.content().toStringUtf8()).isEqualTo("pooled content");
+        assertEquals(HttpStatus.OK, response.status());
+        assertThat(response.contentUtf8()).isEqualTo("pooled content");
         await().untilAsserted(() -> assertThat(releasedByteBuf.get().refCnt()).isZero());
     }
 
@@ -616,5 +605,14 @@ public class HttpClientIntegrationTest {
         await().untilAsserted(() -> assertThat(obj).hasValue(HttpHeaders.of(HttpStatus.OK)));
         factory.close();
         await().untilAsserted(() -> assertThat(completed).hasValue(true));
+    }
+
+    @Test
+    public void testEscapedPathParam() throws Exception {
+        final HttpClient client = HttpClient.of(server.uri("/"));
+
+        final AggregatedHttpMessage response = client.get("/oneparam/foo%2Fbar").aggregate().get();
+
+        assertEquals("routed", response.contentUtf8());
     }
 }

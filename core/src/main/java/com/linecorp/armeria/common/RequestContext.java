@@ -151,6 +151,12 @@ public interface RequestContext extends AttributeMap {
     String path();
 
     /**
+     * Returns the absolute path part of the current {@link Request} URI, excluding the query part,
+     * decoded in UTF-8.
+     */
+    String decodedPath();
+
+    /**
      * Returns the query part of the current {@link Request} URI, without the leading {@code '?'},
      * as defined in <a href="https://tools.ietf.org/html/rfc3986">RFC3986</a>.
      */
@@ -433,7 +439,10 @@ public interface RequestContext extends AttributeMap {
     /**
      * Returns whether this {@link RequestContext} has been timed-out (e.g., when the corresponding request
      * passes a deadline).
+     *
+     * @deprecated Use {@link ServiceRequestContext#isTimedOut()}.
      */
+    @Deprecated
     boolean isTimedOut();
 
     /**

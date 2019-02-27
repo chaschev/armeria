@@ -19,6 +19,8 @@ package com.linecorp.armeria.common.util;
 import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.channels.ClosedChannelException;
 import java.util.concurrent.CompletionException;
@@ -29,6 +31,7 @@ import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
+import javax.net.ssl.SSLException;
 
 import org.slf4j.Logger;
 
@@ -52,6 +55,9 @@ public final class Exceptions {
 
     private static final Pattern IGNORABLE_HTTP2_ERROR_MESSAGE = Pattern.compile(
             "(?:stream closed)", Pattern.CASE_INSENSITIVE);
+
+    private static final Pattern IGNORABLE_TLS_ERROR_MESSAGE = Pattern.compile(
+            "(?:closed already)", Pattern.CASE_INSENSITIVE);
 
     private static final StackTraceElement[] EMPTY_STACK_TRACE = new StackTraceElement[0];
 
@@ -129,11 +135,14 @@ public final class Exceptions {
      *   <li>{@link IOException} - 'Connection reset/closed/aborted by peer'</li>
      *   <li>'Broken pipe'</li>
      *   <li>{@link Http2Exception} - 'Stream closed'</li>
+     *   <li>{@link SSLException} - 'SSLEngine closed already'</li>
      * </ul>
+     *
+     * @see Flags#verboseSocketExceptions()
      */
     public static boolean isExpected(Throwable cause) {
-        if (Flags.verboseExceptions()) {
-            return true;
+        if (Flags.verboseSocketExceptions()) {
+            return false;
         }
 
         // We do not need to log every exception because some exceptions are expected to occur.
@@ -152,6 +161,11 @@ public final class Exceptions {
             }
 
             if (cause instanceof Http2Exception && IGNORABLE_HTTP2_ERROR_MESSAGE.matcher(msg).find()) {
+                // Can happen when disconnected prematurely.
+                return true;
+            }
+
+            if (cause instanceof SSLException && IGNORABLE_TLS_ERROR_MESSAGE.matcher(msg).find()) {
                 // Can happen when disconnected prematurely.
                 return true;
             }
@@ -191,6 +205,7 @@ public final class Exceptions {
      *         e.g. {@code return Exceptions.throwUnsafely(...);} vs.
      *              {@code Exceptions.throwUnsafely(...); return null;}
      */
+    @SuppressWarnings("ReturnOfNull")
     public static <T> T throwUnsafely(Throwable cause) {
         doThrowUnsafely(requireNonNull(cause, "cause"));
         return null; // Never reaches here.
@@ -222,14 +237,144 @@ public final class Exceptions {
     }
 
     /**
-     * Returns the stack trace of the specified {@code exception} as a {@link String} instead.
-     *
-     * @deprecated Use {@link Throwables#getStackTraceAsString(Throwable)}.
+     * Converts the stack trace of the specified {@code exception} into a {@link String}.
+     * This method always uses {@code '\n'} as a line delimiter, unlike
+     * {@link Throwable#printStackTrace(PrintWriter)} or {@link Throwables#getStackTraceAsString(Throwable)}.
      */
-    @Deprecated
     public static String traceText(Throwable exception) {
-        return Throwables.getStackTraceAsString(exception);
+        final StackTraceWriter writer = new StackTraceWriter();
+        exception.printStackTrace(writer);
+        return writer.toString();
     }
 
     private Exceptions() {}
+
+    /**
+     * A variant of {@link PrintWriter} that 1) is backed by a {@link StringWriter}, 2) removes locking,
+     * 3) always uses {@code '\n'} as a line delimiter.
+     */
+    private static final class StackTraceWriter extends PrintWriter {
+        StackTraceWriter() {
+            super(new StringWriter(512));
+        }
+
+        @Override
+        public String toString() {
+            return out.toString();
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void close() {}
+
+        @Override
+        public void write(int c) {
+            try {
+                out.write(c);
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void write(char[] buf, int off, int len) {
+            try {
+                out.write(buf, off, len);
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void write(char[] buf) {
+            try {
+                out.write(buf);
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void write(String s, int off, int len) {
+            try {
+                out.write(s, off, len);
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void write(String s) {
+            try {
+                out.write(s);
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void println() {
+            try {
+                out.write('\n');
+            } catch (IOException e) {
+                setError();
+            }
+        }
+
+        @Override
+        public void println(boolean x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(char x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(int x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(long x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(float x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(double x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(char[] x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(String x) {
+            print(x);
+            println();
+        }
+
+        @Override
+        public void println(Object x) {
+            print(x);
+            println();
+        }
+    }
 }

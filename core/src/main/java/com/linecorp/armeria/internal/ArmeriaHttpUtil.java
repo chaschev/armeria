@@ -37,23 +37,30 @@ import static io.netty.handler.codec.http2.Http2Error.PROTOCOL_ERROR;
 import static io.netty.handler.codec.http2.Http2Exception.streamError;
 import static io.netty.util.AsciiString.EMPTY_STRING;
 import static io.netty.util.ByteProcessor.FIND_COMMA;
+import static io.netty.util.internal.StringUtil.decodeHexNibble;
 import static io.netty.util.internal.StringUtil.isNullOrEmpty;
 import static io.netty.util.internal.StringUtil.length;
+import static java.util.Objects.requireNonNull;
 
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.function.BiConsumer;
 
 import javax.annotation.Nullable;
 
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Ascii;
 import com.google.common.base.Splitter;
+import com.google.common.base.Strings;
 
 import com.linecorp.armeria.common.DefaultHttpHeaders;
 import com.linecorp.armeria.common.Flags;
@@ -105,6 +112,12 @@ public final class ArmeriaHttpUtil {
                 }
             };
 
+    /**
+     * The default HTTP content-type charset.
+     * See https://tools.ietf.org/html/rfc2616#section-3.7.1
+     */
+    public static final Charset HTTP_DEFAULT_CONTENT_CHARSET = StandardCharsets.ISO_8859_1;
+
     private static final URI ROOT = URI.create("/");
 
     /**
@@ -116,6 +129,11 @@ public final class ArmeriaHttpUtil {
      * The set of headers that should not be directly copied when converting headers from HTTP/2 to HTTP/1.
      */
     private static final CharSequenceMap HTTP2_TO_HTTP_HEADER_BLACKLIST = new CharSequenceMap();
+
+    /**
+     * The set of headers that must not be directly copied when converting trailing headers.
+     */
+    private static final CharSequenceMap HTTP_TRAILER_BLACKLIST = new CharSequenceMap();
 
     static {
         HTTP_TO_HTTP2_HEADER_BLACKLIST.add(HttpHeaderNames.CONNECTION, EMPTY_STRING);
@@ -132,16 +150,54 @@ public final class ArmeriaHttpUtil {
         HTTP_TO_HTTP2_HEADER_BLACKLIST.add(ExtensionHeaderNames.SCHEME.text(), EMPTY_STRING);
         HTTP_TO_HTTP2_HEADER_BLACKLIST.add(ExtensionHeaderNames.PATH.text(), EMPTY_STRING);
 
+        // https://tools.ietf.org/html/rfc7540#section-8.1.2.3
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.AUTHORITY, EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.METHOD, EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.PATH, EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.SCHEME, EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.STATUS, EMPTY_STRING);
+
+        // https://tools.ietf.org/html/rfc7540#section-8.1
+        // The "chunked" transfer encoding defined in Section 4.1 of [RFC7230] MUST NOT be used in HTTP/2.
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.TRANSFER_ENCODING, EMPTY_STRING);
-        HTTP2_TO_HTTP_HEADER_BLACKLIST.add(HttpHeaderNames.TRAILER, EMPTY_STRING);
+
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(ExtensionHeaderNames.STREAM_ID.text(), EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(ExtensionHeaderNames.SCHEME.text(), EMPTY_STRING);
         HTTP2_TO_HTTP_HEADER_BLACKLIST.add(ExtensionHeaderNames.PATH.text(), EMPTY_STRING);
+
+        // https://tools.ietf.org/html/rfc7230#section-4.1.2
+        // https://tools.ietf.org/html/rfc7540#section-8.1
+        // A sender MUST NOT generate a trailer that contains a field necessary for message framing:
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.TRANSFER_ENCODING, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.CONTENT_LENGTH, EMPTY_STRING);
+
+        // for request modifiers:
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.CACHE_CONTROL, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.EXPECT, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.HOST, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.MAX_FORWARDS, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.PRAGMA, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.RANGE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.TE, EMPTY_STRING);
+
+        // for authentication:
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.WWW_AUTHENTICATE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.AUTHORIZATION, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.PROXY_AUTHENTICATE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.PROXY_AUTHORIZATION, EMPTY_STRING);
+
+        // for response control data:
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.DATE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.LOCATION, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.RETRY_AFTER, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.VARY, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.WARNING, EMPTY_STRING);
+
+        // or for determining how to process the payload:
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.CONTENT_ENCODING, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.CONTENT_TYPE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.CONTENT_RANGE, EMPTY_STRING);
+        HTTP_TRAILER_BLACKLIST.add(HttpHeaderNames.TRAILER, EMPTY_STRING);
     }
 
     /**
@@ -227,6 +283,48 @@ public final class ArmeriaHttpUtil {
     }
 
     /**
+     * Decodes a percent-encoded path string.
+     */
+    public static String decodePath(String path) {
+        if (path.indexOf('%') < 0) {
+            // No need to decoded; not percent-encoded
+            return path;
+        }
+
+        // Decode percent-encoded characters.
+        // An invalid character is replaced with 0xFF, which will be replaced into '�' by UTF-8 decoder.
+        final int len = path.length();
+        final byte[] buf = new byte[len];
+        int dstLen = 0;
+        for (int i = 0; i < len; i++) {
+            final char ch = path.charAt(i);
+            if (ch != '%') {
+                buf[dstLen++] = (byte) ((ch & 0xFF80) == 0 ? ch : 0xFF);
+                continue;
+            }
+
+            // Decode a percent-encoded character.
+            final int hexEnd = i + 3;
+            if (hexEnd > len) {
+                // '%' or '%x' (must be followed by two hexadigits)
+                buf[dstLen++] = (byte) 0xFF;
+                break;
+            }
+
+            final int digit1 = decodeHexNibble(path.charAt(++i));
+            final int digit2 = decodeHexNibble(path.charAt(++i));
+            if (digit1 < 0 || digit2 < 0) {
+                // The first or second digit is not hexadecimal.
+                buf[dstLen++] = (byte) 0xFF;
+            } else {
+                buf[dstLen++] = (byte) ((digit1 << 4) | digit2);
+            }
+        }
+
+        return new String(buf, 0, dstLen, StandardCharsets.UTF_8);
+    }
+
+    /**
      * Returns {@code true} if the content of the response with the given {@link HttpStatus} is expected to
      * be always empty (1xx, 204, 205 and 304 responses.)
      */
@@ -236,10 +334,11 @@ public final class ArmeriaHttpUtil {
         }
 
         switch (status.code()) {
-            case 204: case 205: case 304:
+            case 204:
+            case 205:
+            case 304:
                 return true;
         }
-
         return false;
     }
 
@@ -269,13 +368,126 @@ public final class ArmeriaHttpUtil {
     }
 
     /**
+     * Returns {@code true} if the specified {@code request} is a CORS preflight request.
+     */
+    public static boolean isCorsPreflightRequest(com.linecorp.armeria.common.HttpRequest request) {
+        requireNonNull(request, "request");
+        return request.method() == HttpMethod.OPTIONS &&
+               request.headers().contains(HttpHeaderNames.ORIGIN) &&
+               request.headers().contains(HttpHeaderNames.ACCESS_CONTROL_REQUEST_METHOD);
+    }
+
+    /**
+     * Parses the specified {@code "cache-control"} directives and invokes the specified {@code callback}
+     * with the directive names and values.
+     */
+    public static void parseCacheControl(String directives, BiConsumer<String, String> callback) {
+        final int len = directives.length();
+        for (int i = 0; i < len;) {
+            final int nameStart = i;
+            final String name;
+            final String value;
+
+            // Find the name.
+            for (; i < len; i++) {
+                final char ch = directives.charAt(i);
+                if (ch == ',' || ch == '=') {
+                    break;
+                }
+            }
+            name = directives.substring(nameStart, i).trim();
+
+            // Find the value.
+            if (i == len || directives.charAt(i) == ',') {
+                // Skip comma or go beyond 'len' to break the loop.
+                i++;
+                value = null;
+            } else {
+                // Skip '='.
+                i++;
+
+                // Skip whitespaces.
+                for (; i < len; i++) {
+                    final char ch = directives.charAt(i);
+                    if (ch != ' ' && ch != '\t') {
+                        break;
+                    }
+                }
+
+                if (i < len && directives.charAt(i) == '\"') {
+                    // Handle quoted string.
+                    // Skip the opening quote.
+                    i++;
+                    final int valueStart = i;
+
+                    // Find the closing quote.
+                    for (; i < len; i++) {
+                        if (directives.charAt(i) == '\"') {
+                            break;
+                        }
+                    }
+                    value = directives.substring(valueStart, i);
+
+                    // Skip the closing quote.
+                    i++;
+
+                    // Find the comma and skip it.
+                    for (; i < len; i++) {
+                        if (directives.charAt(i) == ',') {
+                            i++;
+                            break;
+                        }
+                    }
+                } else {
+                    // Handle unquoted string.
+                    final int valueStart = i;
+
+                    // Find the comma.
+                    for (; i < len; i++) {
+                        if (directives.charAt(i) == ',') {
+                            break;
+                        }
+                    }
+                    value = directives.substring(valueStart, i).trim();
+
+                    // Skip the comma.
+                    i++;
+                }
+            }
+
+            if (!name.isEmpty()) {
+                callback.accept(Ascii.toLowerCase(name), Strings.emptyToNull(value));
+            }
+        }
+    }
+
+    /**
+     * Converts the specified {@code "cache-control"} directive value into a long integer.
+     *
+     * @return the converted value if {@code value} is equal to or greater than {@code 0}.
+     *         {@code -1} otherwise, i.e. if a negative integer or not a number.
+     */
+    public static long parseCacheControlSeconds(@Nullable String value) {
+        if (value == null) {
+            return -1;
+        }
+
+        try {
+            final long converted = Long.parseLong(value);
+            return converted >= 0 ? converted : -1;
+        } catch (NumberFormatException e) {
+            return -1;
+        }
+    }
+
+    /**
      * Converts the specified Netty HTTP/2 into Armeria HTTP/2 headers.
      */
-    public static HttpHeaders toArmeria(Http2Headers headers) {
-        final HttpHeaders converted = new DefaultHttpHeaders(false, headers.size());
+    public static HttpHeaders toArmeria(Http2Headers headers, boolean endOfStream) {
+        final HttpHeaders converted = new DefaultHttpHeaders(false, headers.size(), endOfStream);
         StringJoiner cookieJoiner = null;
         for (Entry<CharSequence, CharSequence> e : headers) {
-            final AsciiString name = AsciiString.of(e.getKey());
+            final AsciiString name = HttpHeaderNames.of(e.getKey());
             final CharSequence value = e.getValue();
 
             // Cookies must be concatenated into a single octet string.
@@ -365,7 +577,7 @@ public final class ArmeriaHttpUtil {
         StringJoiner cookieJoiner = null;
         while (iter.hasNext()) {
             final Entry<CharSequence, CharSequence> entry = iter.next();
-            final AsciiString aName = AsciiString.of(entry.getKey()).toLowerCase();
+            final AsciiString aName = HttpHeaderNames.of(entry.getKey()).toLowerCase();
             if (HTTP_TO_HTTP2_HEADER_BLACKLIST.contains(aName) || connectionBlacklist.contains(aName)) {
                 continue;
             }
@@ -399,7 +611,7 @@ public final class ArmeriaHttpUtil {
         final CharSequenceMap result = new CharSequenceMap(arraySizeHint);
 
         while (valuesIter.hasNext()) {
-            final AsciiString lowerCased = AsciiString.of(valuesIter.next()).toLowerCase();
+            final AsciiString lowerCased = HttpHeaderNames.of(valuesIter.next()).toLowerCase();
             try {
                 int index = lowerCased.forEachByte(FIND_COMMA);
                 if (index != -1) {
@@ -527,12 +739,24 @@ public final class ArmeriaHttpUtil {
     /**
      * Converts the specified Armeria HTTP/2 headers into Netty HTTP/2 headers.
      */
-    public static Http2Headers toNettyHttp2(HttpHeaders in) {
+    public static Http2Headers toNettyHttp2(HttpHeaders in, boolean server) {
         final Http2Headers out = new DefaultHttp2Headers(false, in.size());
-        out.set(in);
-        out.remove(HttpHeaderNames.CONNECTION);
-        out.remove(HttpHeaderNames.TRANSFER_ENCODING);
-        out.remove(HttpHeaderNames.TRAILER);
+
+        // Trailing headers if it does not have :status.
+        if (server && in.status() == null) {
+            for (Entry<AsciiString, String> entry : in) {
+                final AsciiString name = entry.getKey();
+                final String value = entry.getValue();
+                if (name.isEmpty() || HTTP_TRAILER_BLACKLIST.contains(name)) {
+                    continue;
+                }
+                out.add(name, value);
+            }
+        } else {
+            out.set(in);
+            out.remove(HttpHeaderNames.CONNECTION);
+            out.remove(HttpHeaderNames.TRANSFER_ENCODING);
+        }
 
         if (!out.contains(HttpHeaderNames.COOKIE)) {
             return out;
@@ -580,8 +804,11 @@ public final class ArmeriaHttpUtil {
                     continue;
                 }
 
-                // https://tools.ietf.org/html/rfc7540#section-8.1.2.3
                 if (name.isEmpty() || HTTP2_TO_HTTP_HEADER_BLACKLIST.contains(name)) {
+                    continue;
+                }
+
+                if (isTrailer && HTTP_TRAILER_BLACKLIST.contains(name)) {
                     continue;
                 }
 
@@ -607,6 +834,74 @@ public final class ArmeriaHttpUtil {
         if (!isTrailer) {
             HttpUtil.setKeepAlive(outputHeaders, httpVersion, true);
         }
+    }
+
+    /**
+     * Returns an {@link HttpHeaders} whose {@link HttpHeaderNames#CONTENT_LENGTH} is added or removed
+     * according to the status of the specified {@code headers}, {@code content} and {@code trailingHeaders}.
+     * The {@link HttpHeaderNames#CONTENT_LENGTH} is removed when:
+     * <ul>
+     *   <li>the status of the specified {@code headers} is one of informational headers,
+     *   {@link HttpStatus#NO_CONTENT} or {@link HttpStatus#RESET_CONTENT}</li>
+     *   <li>the trailing headers exists</li>
+     * </ul>
+     * The {@link HttpHeaderNames#CONTENT_LENGTH} is added when the state of the specified {@code headers}
+     * does not meet the conditions above and {@link HttpHeaderNames#CONTENT_LENGTH} is not present
+     * regardless of the fact that the content is empty or not.
+     *
+     * @throws IllegalArgumentException if the specified {@code content} or {@code trailingHeaders} are
+     *                                  non-empty when the content is always empty
+     */
+    public static HttpHeaders setOrRemoveContentLength(HttpHeaders headers, HttpData content,
+                                                       HttpHeaders trailingHeaders) {
+        requireNonNull(headers, "headers");
+        requireNonNull(content, "content");
+        requireNonNull(trailingHeaders, "trailingHeaders");
+
+        final HttpStatus status = headers.status();
+        assert status != null;
+
+        if (isContentAlwaysEmptyWithValidation(status, content, trailingHeaders)) {
+            if (status != HttpStatus.NOT_MODIFIED) {
+                if (headers.contains(HttpHeaderNames.CONTENT_LENGTH)) {
+                    final HttpHeaders mutable = headers.toMutable();
+                    mutable.remove(HttpHeaderNames.CONTENT_LENGTH);
+                    return mutable.asImmutable();
+                }
+            } else {
+                // 304 response can have the "content-length" header when it is a response to a conditional
+                // GET request. See https://tools.ietf.org/html/rfc7230#section-3.3.2
+            }
+
+            return headers.asImmutable();
+        }
+
+        if (!trailingHeaders.isEmpty()) {
+            // Some of the client implementations such as "curl" ignores trailing headers if
+            // the "content-length" header is present. We should not set "content-length" header when trailing
+            // headers exists so that those clients can receive the trailing headers.
+            // The response is sent using chunked transfer encoding in HTTP/1 or a DATA frame payload
+            // in HTTP/2, so it's no worry.
+            if (headers.contains(HttpHeaderNames.CONTENT_LENGTH)) {
+                final HttpHeaders mutable = headers.toMutable();
+                mutable.remove(HttpHeaderNames.CONTENT_LENGTH);
+                return mutable.asImmutable();
+            }
+
+            return headers.asImmutable();
+        }
+
+        if (!headers.contains(HttpHeaderNames.CONTENT_LENGTH) || !content.isEmpty()) {
+            final HttpHeaders mutable = headers.toMutable();
+            mutable.setInt(HttpHeaderNames.CONTENT_LENGTH, content.length());
+            return mutable.asImmutable();
+        } else {
+            // The header contains "content-length" header and the content is empty.
+            // Do not overwrite the header because a response to a HEAD request
+            // will have no content even if it has non-zero content-length header.
+        }
+
+        return headers.asImmutable();
     }
 
     private static String convertHeaderValue(AsciiString name, CharSequence value) {

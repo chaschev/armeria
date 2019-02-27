@@ -26,13 +26,12 @@ import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 import javax.annotation.Nullable;
-import javax.net.ssl.SSLSession;
 
+import com.linecorp.armeria.internal.ArmeriaHttpUtil;
 import com.linecorp.armeria.internal.DefaultAttributeMap;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.channel.Channel;
-import io.netty.handler.ssl.SslHandler;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
@@ -46,6 +45,8 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
     private final SessionProtocol sessionProtocol;
     private final HttpMethod method;
     private final String path;
+    @Nullable
+    private String decodedPath;
     @Nullable
     private final String query;
     private final Request request;
@@ -104,18 +105,6 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
         return ch != null ? (A) ch.localAddress() : null;
     }
 
-    @Nullable
-    @Override
-    public SSLSession sslSession() {
-        final Channel ch = channel();
-        if (ch == null) {
-            return null;
-        }
-
-        final SslHandler sslHandler = ch.pipeline().get(SslHandler.class);
-        return sslHandler != null ? sslHandler.engine().getSession() : null;
-    }
-
     @Override
     public final HttpMethod method() {
         return method;
@@ -124,6 +113,16 @@ public abstract class NonWrappingRequestContext extends AbstractRequestContext {
     @Override
     public final String path() {
         return path;
+    }
+
+    @Override
+    public final String decodedPath() {
+        final String decodedPath = this.decodedPath;
+        if (decodedPath != null) {
+            return decodedPath;
+        }
+
+        return this.decodedPath = ArmeriaHttpUtil.decodePath(path);
     }
 
     @Override

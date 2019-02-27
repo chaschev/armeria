@@ -20,16 +20,21 @@ import static io.netty.handler.codec.http2.Http2Error.INTERNAL_ERROR;
 
 import javax.annotation.Nullable;
 
-import com.google.common.base.MoreObjects;
-import com.google.common.base.Throwables;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
+import com.linecorp.armeria.client.ClientFactory;
+import com.linecorp.armeria.common.util.Exceptions;
+import com.linecorp.armeria.server.Server;
+
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.http2.Http2ConnectionDecoder;
 import io.netty.handler.codec.http2.Http2ConnectionEncoder;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
 import io.netty.handler.codec.http2.Http2Exception;
-import io.netty.handler.codec.http2.Http2Exception.ClosedStreamCreationException;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.codec.http2.Http2Stream.State;
 import io.netty.handler.codec.http2.Http2StreamVisitor;
@@ -38,6 +43,8 @@ import io.netty.handler.codec.http2.Http2StreamVisitor;
  * An {@link Http2ConnectionHandler} with some workarounds and additional extension points.
  */
 public abstract class AbstractHttp2ConnectionHandler extends Http2ConnectionHandler {
+
+    private static final Logger logger = LoggerFactory.getLogger(AbstractHttp2ConnectionHandler.class);
 
     /**
      * XXX(trustin): Don't know why, but {@link Http2ConnectionHandler} does not close the last stream
@@ -76,53 +83,47 @@ public abstract class AbstractHttp2ConnectionHandler extends Http2ConnectionHand
         }
 
         handlingConnectionError = true;
-
-        // TODO(trustin): Remove this once Http2ConnectionHandler.goAway() sends better debugData.
-        //                See https://github.com/netty/netty/issues/5160
-        if (http2Ex == null) {
-            http2Ex = new Http2Exception(INTERNAL_ERROR, goAwayDebugData(null, cause), cause);
-        } else if (http2Ex instanceof ClosedStreamCreationException) {
-            final ClosedStreamCreationException e = (ClosedStreamCreationException) http2Ex;
-            http2Ex = new ClosedStreamCreationException(e.error(), goAwayDebugData(e, cause), cause);
-        } else {
-            http2Ex = new Http2Exception(
-                    http2Ex.error(), goAwayDebugData(http2Ex, cause), cause, http2Ex.shutdownHint());
+        if (!Exceptions.isExpected(cause)) {
+            logger.warn("{} HTTP/2 connection error:", ctx.channel(), cause);
         }
-
-        super.onConnectionError(ctx, outbound, cause, http2Ex);
+        super.onConnectionError(ctx, outbound, cause, filterHttp2Exception(cause, http2Ex));
     }
 
-    private static String goAwayDebugData(@Nullable Http2Exception http2Ex, @Nullable Throwable cause) {
-        final StringBuilder buf = new StringBuilder(256);
-        final String type;
-        final String message;
-
+    private static Http2Exception filterHttp2Exception(Throwable cause, @Nullable Http2Exception http2Ex) {
         if (http2Ex != null) {
-            type = http2Ex.getClass().getName();
-            message = http2Ex.getMessage();
-        } else {
-            type = null;
-            message = null;
+            return http2Ex;
         }
 
-        buf.append("type: ");
-        buf.append(MoreObjects.firstNonNull(type, "n/a"));
-        buf.append(", message: ");
-        buf.append(MoreObjects.firstNonNull(message, "n/a"));
-        buf.append(", cause: ");
-        buf.append(cause != null ? Throwables.getStackTraceAsString(cause) : "n/a");
+        // Do not let Netty use the exception message as debug data, just in case the exception message
+        // exposes sensitive information.
+        return new Http2Exception(INTERNAL_ERROR, null, cause);
+    }
 
-        return buf.toString();
+    @Override
+    public ChannelFuture goAway(ChannelHandlerContext ctx, int lastStreamId, long errorCode, ByteBuf debugData,
+                                ChannelPromise promise) {
+        if (!ctx.channel().isActive()) {
+            // There's no point of sending a GOAWAY frame because the connection is over already.
+            promise.unvoid().trySuccess();
+            debugData.release();
+            return promise;
+        }
+
+        return super.goAway(ctx, lastStreamId, errorCode, debugData, promise);
     }
 
     @Override
     public void close(ChannelHandlerContext ctx, ChannelPromise promise) throws Exception {
-        closing = true;
+        if (!closing) {
+            closing = true;
 
-        // TODO(trustin): Remove this line once https://github.com/netty/netty/issues/4210 is fixed.
-        connection().forEachActiveStream(closeAllStreams);
+            if (needsImmediateDisconnection()) {
+                connection().forEachActiveStream(closeAllStreams);
+            }
 
-        onCloseRequest(ctx);
+            onCloseRequest(ctx);
+        }
+
         super.close(ctx, promise);
     }
 
@@ -131,4 +132,15 @@ public abstract class AbstractHttp2ConnectionHandler extends Http2ConnectionHand
      * streams have been closed.
      */
     protected abstract void onCloseRequest(ChannelHandlerContext ctx) throws Exception;
+
+    /**
+     * Returns {@code true} if the connection has to be closed immediately rather than sending a GOAWAY
+     * frame and waiting for the remaining streams. This method should return {@code true} when:
+     * <ul>
+     *   <li>{@link ClientFactory} is being closed.</li>
+     *   <li>{@link Server} is being stopped.</li>
+     *   <li>Received a GOAWAY frame with non-OK error code.</li>
+     * </ul>
+     */
+    protected abstract boolean needsImmediateDisconnection();
 }

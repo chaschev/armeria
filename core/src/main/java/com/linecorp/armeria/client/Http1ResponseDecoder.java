@@ -28,6 +28,7 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.ProtocolViolationException;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.InboundTrafficController;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -61,7 +62,7 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
     private State state = State.NEED_HEADERS;
 
     Http1ResponseDecoder(Channel channel) {
-        super(channel);
+        super(channel, InboundTrafficController.ofHttp1(channel));
     }
 
     @Override
@@ -72,20 +73,17 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
         final HttpResponseWrapper resWrapper =
                 super.addResponse(id, req, res, logBuilder, responseTimeoutMillis, maxContentLength);
 
-        resWrapper.completionFuture().whenComplete((unused, cause) -> {
-            if (cause != null) {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close(cause);
+        resWrapper.completionFuture().handle((unused, cause) -> {
+            // Cancel timeout future and abort the request if it exists.
+            resWrapper.onSubscriptionCancelled();
 
+            if (cause != null) {
                 // Disconnect when the response has been closed with an exception because there's no way
                 // to recover from it in HTTP/1.
                 channel().close();
-            } else {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close();
             }
+
+            return null;
         });
 
         return resWrapper;
@@ -146,13 +144,15 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
                         assert res != null;
                         this.res = res;
 
+                        res.logResponseFirstBytesTransferred();
+
                         if (nettyRes.status().codeClass() == HttpStatusClass.INFORMATIONAL) {
                             state = State.NEED_INFORMATIONAL_DATA;
                         } else {
                             state = State.NEED_DATA_OR_TRAILING_HEADERS;
                         }
 
-                        res.scheduleTimeout(ctx);
+                        res.scheduleTimeout(channel().eventLoop());
                         res.write(ArmeriaHttpUtil.toArmeria(nettyRes));
                     } else {
                         failWithUnexpectedMessageType(ctx, msg);
@@ -202,7 +202,7 @@ final class Http1ResponseDecoder extends HttpResponseDecoder implements ChannelI
 
                             res.close();
 
-                            if (needsToDisconnect()) {
+                            if (needsToDisconnectNow()) {
                                 ctx.close();
                             }
                         }

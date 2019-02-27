@@ -16,8 +16,10 @@
 
 package com.linecorp.armeria.client;
 
+import static com.linecorp.armeria.internal.ClientUtil.executeWithFallback;
+
 import java.net.URI;
-import java.util.function.Function;
+import java.util.function.BiFunction;
 
 import javax.annotation.Nullable;
 
@@ -27,7 +29,6 @@ import com.linecorp.armeria.common.Response;
 import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.util.ReleasableHolder;
-import com.linecorp.armeria.common.util.SafeCloseable;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.channel.EventLoop;
@@ -118,12 +119,12 @@ public abstract class UserClient<I extends Request, O extends Response> implemen
      * @param query the query part of the {@link Request} URI
      * @param fragment the fragment part of the {@link Request} URI
      * @param req the {@link Request}
-     * @param fallback the fallback response {@link Function} to use when
+     * @param fallback the fallback response {@link BiFunction} to use when
      *                 {@link Client#execute(ClientRequestContext, Request)} of {@link #delegate()} throws
      *                 an exception instead of returning an error response
      */
     protected final O execute(HttpMethod method, String path, @Nullable String query, @Nullable String fragment,
-                              I req, Function<Throwable, O> fallback) {
+                              I req, BiFunction<ClientRequestContext, Throwable, O> fallback) {
         return execute(null, method, path, query, fragment, req, fallback);
     }
 
@@ -136,12 +137,12 @@ public abstract class UserClient<I extends Request, O extends Response> implemen
      * @param query the query part of the {@link Request} URI
      * @param fragment the fragment part of the {@link Request} URI
      * @param req the {@link Request}
-     * @param fallback the fallback response {@link Function} to use when
+     * @param fallback the fallback response {@link BiFunction} to use when
      *                 {@link Client#execute(ClientRequestContext, Request)} of {@link #delegate()} throws
      */
     protected final O execute(@Nullable EventLoop eventLoop,
                               HttpMethod method, String path, @Nullable String query, @Nullable String fragment,
-                              I req, Function<Throwable, O> fallback) {
+                              I req, BiFunction<ClientRequestContext, Throwable, O> fallback) {
 
         final ClientRequestContext ctx;
         if (eventLoop == null) {
@@ -155,11 +156,6 @@ public abstract class UserClient<I extends Request, O extends Response> implemen
                                                   method, path, query, fragment, options(), req);
         }
 
-        try (SafeCloseable ignored = ctx.push()) {
-            return delegate().execute(ctx, req);
-        } catch (Throwable cause) {
-            ctx.logBuilder().endResponse(cause);
-            return fallback.apply(cause);
-        }
+        return executeWithFallback(delegate(), ctx, req, fallback);
     }
 }

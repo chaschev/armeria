@@ -46,11 +46,9 @@ import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableMap;
 
-import com.linecorp.armeria.client.ClientOptions;
 import com.linecorp.armeria.client.ClientRequestContext;
-import com.linecorp.armeria.client.DefaultClientRequestContext;
+import com.linecorp.armeria.client.ClientRequestContextBuilder;
 import com.linecorp.armeria.client.Endpoint;
 import com.linecorp.armeria.common.DefaultRpcRequest;
 import com.linecorp.armeria.common.DefaultRpcResponse;
@@ -61,23 +59,16 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.RpcRequest;
 import com.linecorp.armeria.common.RpcResponse;
-import com.linecorp.armeria.common.SessionProtocol;
 import com.linecorp.armeria.common.logback.HelloService.hello_args;
 import com.linecorp.armeria.common.logback.HelloService.hello_result;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
-import com.linecorp.armeria.common.metric.NoopMeterRegistry;
 import com.linecorp.armeria.common.thrift.ThriftCall;
 import com.linecorp.armeria.common.thrift.ThriftReply;
 import com.linecorp.armeria.common.thrift.ThriftSerializationFormats;
 import com.linecorp.armeria.common.util.SafeCloseable;
-import com.linecorp.armeria.server.DefaultServiceRequestContext;
-import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.PathMappingContext;
-import com.linecorp.armeria.server.PathMappingResult;
-import com.linecorp.armeria.server.Server;
-import com.linecorp.armeria.server.ServerBuilder;
-import com.linecorp.armeria.server.ServiceConfig;
 import com.linecorp.armeria.server.ServiceRequestContext;
+import com.linecorp.armeria.server.ServiceRequestContextBuilder;
 import com.linecorp.armeria.server.VirtualHost;
 
 import ch.qos.logback.classic.Level;
@@ -88,8 +79,6 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import ch.qos.logback.core.status.Status;
 import ch.qos.logback.core.status.StatusManager;
-import io.netty.channel.Channel;
-import io.netty.channel.EventLoop;
 import io.netty.util.AttributeKey;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
@@ -277,6 +266,7 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("remote.host", "client.com")
                            .containsEntry("remote.ip", "1.2.3.4")
                            .containsEntry("remote.port", "5678")
+                           .containsEntry("client.ip", "9.10.11.12")
                            .containsEntry("req.direction", "INBOUND")
                            .containsEntry("req.authority", "server.com:8080")
                            .containsEntry("req.method", "GET")
@@ -286,7 +276,7 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("tls.session_id", "0101020305080d15")
                            .containsEntry("tls.proto", "TLSv1.2")
                            .containsEntry("tls.cipher", "some-cipher")
-                           .hasSize(15);
+                           .hasSize(16);
         }
     }
 
@@ -313,8 +303,9 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("remote.host", "client.com")
                            .containsEntry("remote.ip", "1.2.3.4")
                            .containsEntry("remote.port", "5678")
+                           .containsEntry("client.ip", "9.10.11.12")
                            .containsEntry("req.direction", "INBOUND")
-                           .containsEntry("req.authority", "?")
+                           .containsEntry("req.authority", "server.com:8080")
                            .containsEntry("req.method", "GET")
                            .containsEntry("req.path", "/foo")
                            .containsEntry("req.query", "name=alice")
@@ -326,7 +317,7 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("tls.proto", "TLSv1.2")
                            .containsEntry("tls.cipher", "some-cipher")
                            .containsKey("elapsed_nanos")
-                           .hasSize(19);
+                           .hasSize(20);
         }
     }
 
@@ -365,6 +356,7 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("remote.host", "client.com")
                            .containsEntry("remote.ip", "1.2.3.4")
                            .containsEntry("remote.port", "5678")
+                           .containsEntry("client.ip", "9.10.11.12")
                            .containsEntry("req.direction", "INBOUND")
                            .containsEntry("req.authority", "server.com:8080")
                            .containsEntry("req.method", "GET")
@@ -384,7 +376,7 @@ public class RequestContextExportingAppenderTest {
                            .containsEntry("tls.cipher", "some-cipher")
                            .containsEntry("attrs.my_attr", "some-attr")
                            .containsKey("elapsed_nanos")
-                           .hasSize(25);
+                           .hasSize(26);
         }
     }
 
@@ -404,28 +396,23 @@ public class RequestContextExportingAppenderTest {
     private static ServiceRequestContext newServiceContext(
             String path, @Nullable String query) throws Exception {
 
-        final Channel ch = mock(Channel.class);
-        when(ch.remoteAddress()).thenReturn(
-                new InetSocketAddress(InetAddress.getByAddress("client.com", new byte[] { 1, 2, 3, 4 }),
-                                      5678));
-        when(ch.localAddress()).thenReturn(
-                new InetSocketAddress(InetAddress.getByAddress("server.com", new byte[] { 5, 6, 7, 8 }),
-                                      8080));
+        final InetSocketAddress remoteAddress = new InetSocketAddress(
+                InetAddress.getByAddress("client.com", new byte[] { 1, 2, 3, 4 }), 5678);
+        final InetSocketAddress localAddress = new InetSocketAddress(
+                InetAddress.getByAddress("server.com", new byte[] { 5, 6, 7, 8 }), 8080);
 
-        final HttpService service = mock(HttpService.class);
-        final Server server = new ServerBuilder().withVirtualHost("some-host.server.com")
-                                                 .serviceUnder("/", service)
-                                                 .and().build();
-        final VirtualHost virtualHost = server.config().findVirtualHost("some-host.server.com");
-        final ServiceConfig serviceConfig = virtualHost.serviceConfigs().get(0);
-        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.GET, path + '?' + query)
-                                                          .authority("server.com:8080"));
-        final PathMappingContext mappingCtx =
-                new DummyPathMappingContext(virtualHost, "server.com", path, query, req.headers());
+        final String pathAndQuery = path + (query != null ? '?' + query : "");
+        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.GET, pathAndQuery)
+                                                          .authority("server.com:8080")
+                                                          .set(HttpHeaderNames.USER_AGENT, "some-client"));
 
-        final ServiceRequestContext ctx = new DefaultServiceRequestContext(
-                serviceConfig, ch, NoopMeterRegistry.get(), SessionProtocol.H2, mappingCtx,
-                PathMappingResult.of(path, query, ImmutableMap.of()), req, newSslSession(), null);
+        final ServiceRequestContext ctx =
+                ServiceRequestContextBuilder.of(req)
+                                            .sslSession(newSslSession())
+                                            .remoteAddress(remoteAddress)
+                                            .localAddress(localAddress)
+                                            .clientAddress(InetAddress.getByName("9.10.11.12"))
+                                            .build();
 
         ctx.attr(MY_ATTR).set(new CustomValue("some-attr"));
         return ctx;
@@ -524,29 +511,23 @@ public class RequestContextExportingAppenderTest {
     private static ClientRequestContext newClientContext(
             String path, @Nullable String query) throws Exception {
 
-        final Channel ch = mock(Channel.class);
-        when(ch.remoteAddress()).thenReturn(
-                new InetSocketAddress(InetAddress.getByAddress("server.com", new byte[] { 1, 2, 3, 4 }),
-                                      8080));
-        when(ch.localAddress()).thenReturn(
-                new InetSocketAddress(InetAddress.getByAddress("client.com", new byte[] { 5, 6, 7, 8 }),
-                                      5678));
+        final InetSocketAddress remoteAddress = new InetSocketAddress(
+                InetAddress.getByAddress("server.com", new byte[] { 1, 2, 3, 4 }), 8080);
+        final InetSocketAddress localAddress = new InetSocketAddress(
+                InetAddress.getByAddress("client.com", new byte[] { 5, 6, 7, 8 }), 5678);
 
-        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.GET, path + '?' + query)
-                                                          .authority("server.com:8080"));
+        final String pathAndQuery = path + (query != null ? '?' + query : "");
+        final HttpRequest req = HttpRequest.of(HttpHeaders.of(HttpMethod.GET, pathAndQuery)
+                                                          .authority("server.com:8080")
+                                                          .set(HttpHeaderNames.USER_AGENT, "some-client"));
 
-        final DefaultClientRequestContext ctx = new DefaultClientRequestContext(
-                mock(EventLoop.class), NoopMeterRegistry.get(), SessionProtocol.H2,
-                Endpoint.of("server.com", 8080), req.method(), path, query, null,
-                ClientOptions.DEFAULT, req) {
-
-            @Override
-            public SSLSession sslSession() {
-                return newSslSession();
-            }
-        };
-
-        ctx.logBuilder().startRequest(ch, ctx.sessionProtocol());
+        final ClientRequestContext ctx =
+                ClientRequestContextBuilder.of(req)
+                                           .remoteAddress(remoteAddress)
+                                           .localAddress(localAddress)
+                                           .endpoint(Endpoint.of("server.com", 8080))
+                                           .sslSession(newSslSession())
+                                           .build();
 
         ctx.attr(MY_ATTR).set(new CustomValue("some-attr"));
         return ctx;
@@ -632,6 +613,11 @@ public class RequestContextExportingAppenderTest {
         @Override
         public List<MediaType> produceTypes() {
             return ImmutableList.of();
+        }
+
+        @Override
+        public boolean isCorsPreflight() {
+            return false;
         }
 
         @Override

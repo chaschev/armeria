@@ -114,9 +114,9 @@ public class HttpHealthCheckedEndpointGroupTest {
                     .containsEntry("armeria.client.endpointGroup.count#value{name=foo,state=healthy}", 2.0)
                     .containsEntry("armeria.client.endpointGroup.count#value{name=foo,state=unhealthy}", 0.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portOne + ",name=foo}", 1.0)
+                                   "{authority=127.0.0.1:" + portOne + ",ip=127.0.0.1,name=foo}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portTwo + ",name=foo}", 1.0);
+                                   "{authority=127.0.0.1:" + portTwo + ",ip=127.0.0.1,name=foo}", 1.0);
         });
 
         serverTwo.stop().get();
@@ -128,10 +128,61 @@ public class HttpHealthCheckedEndpointGroupTest {
                     .containsEntry("armeria.client.endpointGroup.count#value{name=foo,state=healthy}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.count#value{name=foo,state=unhealthy}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portOne + ",name=foo}", 1.0)
+                                   "{authority=127.0.0.1:" + portOne + ",ip=127.0.0.1,name=foo}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portTwo + ",name=foo}", 0.0);
+                                   "{authority=127.0.0.1:" + portTwo + ",ip=127.0.0.1,name=foo}", 0.0);
         });
+    }
+
+    @Test
+    public void endpoints_withIpAndNoIp() throws Exception {
+        serverOne.start();
+        serverTwo.start();
+
+        final int portOne = serverOne.port(protocol);
+        final int portTwo = serverTwo.port(protocol);
+
+        new HttpHealthCheckedEndpointGroupBuilder(
+                new StaticEndpointGroup(Endpoint.of("127.0.0.1", portOne)),
+                HEALTH_CHECK_PATH)
+                .protocol(protocol)
+                .clientFactory(clientFactory)
+                .build().newMeterBinder("foo").bindTo(registry);
+
+        new HttpHealthCheckedEndpointGroupBuilder(
+                new StaticEndpointGroup(Endpoint.of("localhost", portTwo)),
+                HEALTH_CHECK_PATH)
+                .protocol(protocol)
+                .clientFactory(clientFactory)
+                .build().newMeterBinder("bar").bindTo(registry);
+
+        await().untilAsserted(() -> {
+            assertThat(MoreMeters.measureAll(registry))
+                    .containsEntry("armeria.client.endpointGroup.count#value{name=foo,state=healthy}", 1.0)
+                    .containsEntry("armeria.client.endpointGroup.count#value{name=bar,state=healthy}", 1.0)
+                    .containsEntry("armeria.client.endpointGroup.healthy#value" +
+                                   "{authority=127.0.0.1:" + portOne + ",ip=127.0.0.1,name=foo}", 1.0)
+                    .containsEntry("armeria.client.endpointGroup.healthy#value" +
+                                   "{authority=localhost:" + portTwo + ",ip=,name=bar}", 1.0);
+        });
+    }
+
+    @Test
+    public void endpoints_customPort() throws Exception {
+        serverOne.start();
+        serverTwo.start();
+        final int portOne = serverOne.port(protocol);
+        final int portTwo = serverTwo.port(protocol);
+
+        final HealthCheckedEndpointGroup endpointGroup = new HttpHealthCheckedEndpointGroupBuilder(
+                new StaticEndpointGroup(Endpoint.of("127.0.0.1", portOne)),
+                HEALTH_CHECK_PATH)
+                .healthCheckPort(portOne)
+                .protocol(protocol)
+                .clientFactory(clientFactory)
+                .build();
+        await().untilAsserted(
+                () -> assertThat(endpointGroup.endpoints()).containsOnly(Endpoint.of("127.0.0.1", portOne)));
     }
 
     @Test
@@ -158,9 +209,9 @@ public class HttpHealthCheckedEndpointGroupTest {
                     .containsEntry("armeria.client.endpointGroup.count#value{name=bar,state=healthy}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.count#value{name=bar,state=unhealthy}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portOne + ",name=bar}", 1.0)
+                                   "{authority=127.0.0.1:" + portOne + ",ip=127.0.0.1,name=bar}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portTwo + ",name=bar}", 0.0);
+                                   "{authority=127.0.0.1:" + portTwo + ",ip=127.0.0.1,name=bar}", 0.0);
         });
     }
 
@@ -188,7 +239,7 @@ public class HttpHealthCheckedEndpointGroupTest {
                     .containsEntry("armeria.client.endpointGroup.count#value{name=baz,state=healthy}", 3.0)
                     .containsEntry("armeria.client.endpointGroup.count#value{name=baz,state=unhealthy}", 0.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=127.0.0.1:" + portOne + ",name=baz}", 1.0);
+                                   "{authority=127.0.0.1:" + portOne + ",ip=127.0.0.1,name=baz}", 1.0);
         });
         serverOne.stop();
         await().untilAsserted(() -> assertThat(endpointGroup.endpoints()).isEmpty());
@@ -223,7 +274,7 @@ public class HttpHealthCheckedEndpointGroupTest {
                     .containsEntry("armeria.client.endpointGroup.count#value{name=qux,state=healthy}", 1.0)
                     .containsEntry("armeria.client.endpointGroup.count#value{name=qux,state=unhealthy}", 0.0)
                     .containsEntry("armeria.client.endpointGroup.healthy#value" +
-                                   "{authority=foo:" + port + ",name=qux}", 1.0);
+                                   "{authority=foo:" + port + ",ip=127.0.0.1,name=qux}", 1.0);
         });
     }
 }

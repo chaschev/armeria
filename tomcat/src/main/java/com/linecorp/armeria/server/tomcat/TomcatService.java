@@ -16,7 +16,6 @@
 
 package com.linecorp.armeria.server.tomcat;
 
-import static com.linecorp.armeria.common.util.Functions.voidFunction;
 import static java.util.Objects.requireNonNull;
 
 import java.lang.invoke.MethodHandle;
@@ -59,7 +58,7 @@ import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpResponseWriter;
 import com.linecorp.armeria.common.HttpStatus;
-import com.linecorp.armeria.common.util.CompletionActions;
+import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.internal.tomcat.TomcatVersion;
 import com.linecorp.armeria.server.HttpService;
 import com.linecorp.armeria.server.HttpStatusException;
@@ -108,7 +107,25 @@ public abstract class TomcatService implements HttpService {
                     "could not find the matching classes for Tomcat version " + ServerInfo.getServerNumber() +
                     "; using a wrong armeria-tomcat JAR?", e);
         }
+
+        if (TomcatVersion.major() >= 9) {
+            try {
+                final Class<?> initClass =
+                        Class.forName(prefix + "ConfigFileLoaderInitializer", true, classLoader);
+                MethodHandles.lookup()
+                             .findStatic(initClass, "init", MethodType.methodType(void.class))
+                             .invoke();
+            } catch (Throwable cause) {
+                logger.debug("Failed to initialize Tomcat ConfigFileLoader.source:", cause);
+            }
+        }
     }
+
+    private static final HttpHeaders INVALID_AUTHORITY_HEADERS =
+            HttpHeaders.of(HttpStatus.BAD_REQUEST)
+                       .setObject(HttpHeaderNames.CONTENT_TYPE, MediaType.PLAIN_TEXT_UTF_8);
+    private static final HttpData INVALID_AUTHORITY_DATA =
+            HttpData.ofUtf8(HttpStatus.BAD_REQUEST + "\nInvalid authority");
 
     TomcatService() {}
 
@@ -257,18 +274,22 @@ public abstract class TomcatService implements HttpService {
         }
 
         final HttpResponseWriter res = HttpResponse.streaming();
-        req.aggregate().handle(voidFunction((aReq, cause) -> {
-            if (cause != null) {
-                logger.warn("{} Failed to aggregate a request:", ctx, cause);
-                res.close(HttpHeaders.of(HttpStatus.INTERNAL_SERVER_ERROR));
-                return;
-            }
-
+        req.aggregate().handle((aReq, cause) -> {
             try {
+                if (cause != null) {
+                    logger.warn("{} Failed to aggregate a request:", ctx, cause);
+                    res.close(HttpHeaders.of(HttpStatus.INTERNAL_SERVER_ERROR));
+                    return null;
+                }
+
                 final Request coyoteReq = convertRequest(ctx, aReq);
                 if (coyoteReq == null) {
-                    res.close(HttpHeaders.of(HttpStatus.BAD_REQUEST));
-                    return;
+                    if (res.tryWrite(INVALID_AUTHORITY_HEADERS)) {
+                        if (res.tryWrite(INVALID_AUTHORITY_DATA)) {
+                            res.close();
+                        }
+                    }
+                    return null;
                 }
                 final Response coyoteRes = new Response();
                 coyoteReq.setResponse(coyoteRes);
@@ -303,7 +324,9 @@ public abstract class TomcatService implements HttpService {
                 logger.warn("{} Failed to invoke Tomcat:", ctx, t);
                 res.close();
             }
-        })).exceptionally(CompletionActions::log);
+
+            return null;
+        });
 
         return res;
     }

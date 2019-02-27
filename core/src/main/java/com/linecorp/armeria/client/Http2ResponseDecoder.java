@@ -27,11 +27,13 @@ import org.slf4j.LoggerFactory;
 
 import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.ContentTooLargeException;
-import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaders;
 import com.linecorp.armeria.common.HttpRequest;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.Http2GoAwayHandler;
+import com.linecorp.armeria.internal.InboundTrafficController;
+import com.linecorp.armeria.unsafe.ByteBufHttpData;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
@@ -53,11 +55,14 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
 
     private final Http2Connection conn;
     private final Http2ConnectionEncoder encoder;
+    private final Http2GoAwayHandler goAwayHandler;
 
-    Http2ResponseDecoder(Http2Connection conn, Channel channel, Http2ConnectionEncoder encoder) {
-        super(channel);
-        this.conn = conn;
+    Http2ResponseDecoder(Channel channel, Http2ConnectionEncoder encoder, HttpClientFactory clientFactory) {
+        super(channel,
+              InboundTrafficController.ofHttp2(channel, clientFactory.http2InitialConnectionWindowSize()));
+        conn = encoder.connection();
         this.encoder = encoder;
+        goAwayHandler = new Http2GoAwayHandler();
     }
 
     @Override
@@ -68,30 +73,37 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
         final HttpResponseWrapper resWrapper =
                 super.addResponse(id, req, res, logBuilder, responseTimeoutMillis, maxContentLength);
 
-        resWrapper.completionFuture().whenCompleteAsync((unused, cause) -> {
-            if (cause != null) {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close(cause);
+        resWrapper.completionFuture().handleAsync((unused, cause) -> {
+            // Cancel timeout future and abort the request if it exists.
+            resWrapper.onSubscriptionCancelled();
 
+            if (cause != null) {
                 // We are not closing the connection but just send a RST_STREAM,
                 // so we have to remove the response manually.
                 removeResponse(id);
 
                 // Reset the stream.
                 final int streamId = idToStreamId(id);
-                if (conn.streamMayHaveExisted(streamId)) {
+                final int lastStreamId = conn.local().lastStreamKnownByPeer();
+                if (lastStreamId < 0 || // Did not receive a GOAWAY yet or
+                    streamId <= lastStreamId) { // received a GOAWAY and the request's streamId <= lastStreamId
                     final ChannelHandlerContext ctx = channel().pipeline().lastContext();
-                    encoder.writeRstStream(ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise());
-                    ctx.flush();
+                    if (ctx != null) {
+                        encoder.writeRstStream(ctx, streamId, Http2Error.CANCEL.code(), ctx.newPromise());
+                        ctx.flush();
+                    } else {
+                        // The pipeline has been cleaned up due to disconnection.
+                    }
                 }
-            } else {
-                // Ensure that the resWrapper is closed.
-                // This is needed in case the response is aborted by the client.
-                resWrapper.close();
             }
+
+            return null;
         }, channel().eventLoop());
         return resWrapper;
+    }
+
+    Http2GoAwayHandler goAwayHandler() {
+        return goAwayHandler;
     }
 
     @Override
@@ -105,9 +117,29 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
 
     @Override
     public void onStreamClosed(Http2Stream stream) {
+        goAwayHandler.onStreamClosed(channel(), stream);
+
         final HttpResponseWrapper res = getResponse(streamIdToId(stream.id()), true);
-        if (res != null) {
+        if (res == null) {
+            return;
+        }
+
+        if (!goAwayHandler.receivedGoAway()) {
             res.close(ClosedSessionException.get());
+            return;
+        }
+
+        final int lastStreamId = conn.local().lastStreamKnownByPeer();
+        if (stream.id() > lastStreamId) {
+            res.close(UnprocessedRequestException.get());
+        } else {
+            res.close(ClosedSessionException.get());
+        }
+
+        // Send a GOAWAY frame if the connection has been scheduled for disconnection and
+        // it did not receive or send a GOAWAY frame.
+        if (needsToDisconnectNow() && !goAwayHandler.sentGoAway() && !goAwayHandler.receivedGoAway()) {
+            channel().close();
         }
     }
 
@@ -115,10 +147,16 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
     public void onStreamRemoved(Http2Stream stream) {}
 
     @Override
-    public void onGoAwaySent(int lastStreamId, long errorCode, ByteBuf debugData) {}
+    public void onGoAwaySent(int lastStreamId, long errorCode, ByteBuf debugData) {
+        disconnectWhenFinished();
+        goAwayHandler.onGoAwaySent(channel(), lastStreamId, errorCode, debugData);
+    }
 
     @Override
-    public void onGoAwayReceived(int lastStreamId, long errorCode, ByteBuf debugData) {}
+    public void onGoAwayReceived(int lastStreamId, long errorCode, ByteBuf debugData) {
+        disconnectWhenFinished();
+        goAwayHandler.onGoAwayReceived(channel(), lastStreamId, errorCode, debugData);
+    }
 
     @Override
     public void onSettingsRead(ChannelHandlerContext ctx, Http2Settings settings) {
@@ -145,14 +183,16 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
                                   streamId);
         }
 
-        final HttpHeaders converted = ArmeriaHttpUtil.toArmeria(headers);
+        res.logResponseFirstBytesTransferred();
+
+        final HttpHeaders converted = ArmeriaHttpUtil.toArmeria(headers, endOfStream);
         try {
             // If this tryWrite() returns false, it means the response stream has been closed due to
             // disconnection or by the response consumer. We do not need to handle such cases here because
             // it will be notified to the response consumer anyway.
             if (!res.tryWrite(converted)) {
                 // Schedule only when the response stream is still open.
-                res.scheduleTimeout(ctx);
+                res.scheduleTimeout(ctx.channel().eventLoop());
             }
         } catch (Throwable t) {
             res.close(t);
@@ -204,7 +244,7 @@ final class Http2ResponseDecoder extends HttpResponseDecoder implements Http2Con
             // If this tryWrite() returns false, it means the response stream has been closed due to
             // disconnection or by the response consumer. We do not need to handle such cases here because
             // it will be notified to the response consumer anyway.
-            res.tryWrite(HttpData.of(data));
+            res.tryWrite(new ByteBufHttpData(data.retain(), endOfStream));
         } catch (Throwable t) {
             res.close(t);
             throw connectionError(INTERNAL_ERROR, t, "failed to consume a DATA frame");

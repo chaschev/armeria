@@ -16,41 +16,33 @@
 
 package com.linecorp.armeria.internal.tracing;
 
-import com.linecorp.armeria.common.RequestContext;
+import java.util.concurrent.TimeUnit;
+
 import com.linecorp.armeria.common.logging.RequestLog;
 
 import brave.Span;
-import brave.Tracer;
-import brave.Tracer.SpanInScope;
-import io.netty.util.concurrent.FastThreadLocal;
 
-/**
- * Utility for pushing and popping a {@link Span} via a {@link RequestContext}.
- */
 public final class SpanContextUtil {
 
     /**
-     * Sets up the {@link RequestContext} to push and pop the {@link Span} whenever it is entered/exited.
+     * Starts the {@link Span} when the log is ready.
      */
-    public static void setupContext(FastThreadLocal<SpanInScope> threadLocalSpan, RequestContext ctx, Span span,
-                                    Tracer tracer) {
-        ctx.onEnter(unused -> threadLocalSpan.set(tracer.withSpanInScope(span)));
-        ctx.onExit(unused -> {
-            final SpanInScope spanInScope = threadLocalSpan.get();
-            if (spanInScope != null) {
-                spanInScope.close();
-                threadLocalSpan.remove();
-            }
-        });
+    public static void startSpan(Span span, RequestLog log) {
+        span.start(log.requestStartTimeMicros());
     }
 
     /**
-     * Adds logging tags to the provided {@link Span} and closes it.
+     * Adds logging tags to the provided {@link Span} and closes it when the log is finished.
      * The span cannot be used further after this method has been called.
      */
     public static void closeSpan(Span span, RequestLog log) {
         SpanTags.addTags(span, log);
-        span.finish();
+        span.finish(wallTimeMicros(log, log.responseEndTimeNanos()));
+    }
+
+    static long wallTimeMicros(RequestLog log, long timeNanos) {
+        long relativeTimeNanos = timeNanos - log.requestStartTimeNanos();
+        return log.requestStartTimeMicros() + TimeUnit.NANOSECONDS.toMicros(relativeTimeNanos);
     }
 
     private SpanContextUtil() {}

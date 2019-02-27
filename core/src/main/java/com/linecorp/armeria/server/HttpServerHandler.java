@@ -17,21 +17,22 @@
 package com.linecorp.armeria.server;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
-import static com.google.common.collect.ImmutableSet.toImmutableSet;
 import static com.linecorp.armeria.common.SessionProtocol.H1;
 import static com.linecorp.armeria.common.SessionProtocol.H1C;
 import static com.linecorp.armeria.common.SessionProtocol.H2;
 import static com.linecorp.armeria.common.SessionProtocol.H2C;
-import static com.linecorp.armeria.common.util.Functions.voidFunction;
+import static com.linecorp.armeria.internal.ArmeriaHttpUtil.isCorsPreflightRequest;
+import static com.linecorp.armeria.server.HttpHeaderUtil.determineClientAddress;
+import static io.netty.handler.codec.http2.Http2CodecUtil.DEFAULT_WINDOW_SIZE;
 import static java.util.Objects.requireNonNull;
 
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.IdentityHashMap;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
@@ -40,7 +41,7 @@ import javax.net.ssl.SSLSession;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.linecorp.armeria.common.AggregatedHttpMessage;
+import com.linecorp.armeria.common.ClosedSessionException;
 import com.linecorp.armeria.common.HttpData;
 import com.linecorp.armeria.common.HttpHeaderNames;
 import com.linecorp.armeria.common.HttpHeaders;
@@ -50,6 +51,7 @@ import com.linecorp.armeria.common.HttpResponse;
 import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.NonWrappingRequestContext;
+import com.linecorp.armeria.common.ProtocolViolationException;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.RequestContext;
 import com.linecorp.armeria.common.SessionProtocol;
@@ -59,16 +61,17 @@ import com.linecorp.armeria.common.logging.RequestLogAvailability;
 import com.linecorp.armeria.common.logging.RequestLogBuilder;
 import com.linecorp.armeria.common.metric.NoopMeterRegistry;
 import com.linecorp.armeria.common.stream.ClosedPublisherException;
-import com.linecorp.armeria.common.stream.StreamMessage;
 import com.linecorp.armeria.common.util.CompletionActions;
 import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.common.util.SafeCloseable;
 import com.linecorp.armeria.internal.AbstractHttp2ConnectionHandler;
 import com.linecorp.armeria.internal.ArmeriaHttpUtil;
+import com.linecorp.armeria.internal.ChannelUtil;
 import com.linecorp.armeria.internal.Http1ObjectEncoder;
 import com.linecorp.armeria.internal.Http2ObjectEncoder;
 import com.linecorp.armeria.internal.HttpObjectEncoder;
 import com.linecorp.armeria.internal.PathAndQuery;
+import com.linecorp.armeria.server.logging.AccessLogWriter;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import io.netty.buffer.Unpooled;
@@ -77,9 +80,12 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPipeline;
 import io.netty.channel.EventLoop;
 import io.netty.channel.socket.ChannelInputShutdownReadComplete;
+import io.netty.handler.codec.http2.Http2Connection;
 import io.netty.handler.codec.http2.Http2ConnectionHandler;
+import io.netty.handler.codec.http2.Http2Exception;
 import io.netty.handler.codec.http2.Http2Settings;
 import io.netty.handler.ssl.SslCloseCompletionEvent;
 import io.netty.handler.ssl.SslHandler;
@@ -96,11 +102,14 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
                     HttpMethod.OPTIONS, HttpMethod.GET, HttpMethod.HEAD, HttpMethod.POST,
                     HttpMethod.PUT, HttpMethod.PATCH, HttpMethod.DELETE, HttpMethod.TRACE));
 
-    private static final Set<String> ALLOWED_METHOD_NAMES =
-            ALLOWED_METHODS.stream().map(HttpMethod::name).collect(toImmutableSet());
-
     private static final String ALLOWED_METHODS_STRING =
             ALLOWED_METHODS.stream().map(HttpMethod::name).collect(Collectors.joining(","));
+
+    private static final String MSG_MISSING_REQUEST_PATH = HttpStatus.BAD_REQUEST + "\nMissing request path";
+    private static final String MSG_INVALID_REQUEST_PATH = HttpStatus.BAD_REQUEST + "\nInvalid request path";
+
+    private static final HttpData DATA_MISSING_REQUEST_PATH = HttpData.ofUtf8(MSG_MISSING_REQUEST_PATH);
+    private static final HttpData DATA_INVALID_REQUEST_PATH = HttpData.ofUtf8(MSG_INVALID_REQUEST_PATH);
 
     private static final ChannelFutureListener CLOSE = future -> {
         final Throwable cause = future.cause();
@@ -164,12 +173,11 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
     @Nullable
     private final ProxiedAddresses proxiedAddresses;
 
-    private int unfinishedRequests;
+    private final IdentityHashMap<DecodedHttpRequest, HttpResponse> unfinishedRequests;
     private boolean isReading;
     private boolean handledLastRequest;
 
-    private final Consumer<RequestLog> accessLogWriter;
-    private final IdentityHashMap<HttpResponse, Boolean> unfinishedResponses;
+    private final AccessLogWriter accessLogWriter;
 
     HttpServerHandler(ServerConfig config,
                       GracefulShutdownSupport gracefulShutdownSupport,
@@ -186,7 +194,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         this.responseEncoder = responseEncoder;
         this.proxiedAddresses = proxiedAddresses;
 
-        unfinishedResponses = new IdentityHashMap<>();
+        unfinishedRequests = new IdentityHashMap<>();
         accessLogWriter = config.accessLogWriter();
     }
 
@@ -197,7 +205,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
 
     @Override
     public int unfinishedRequests() {
-        return unfinishedRequests;
+        return unfinishedRequests.size();
     }
 
     @Override
@@ -231,7 +239,13 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
             responseEncoder.close();
         }
 
-        unfinishedResponses.keySet().forEach(StreamMessage::abort);
+        unfinishedRequests.forEach((req, res) -> {
+            // Mark the request stream as closed due to disconnection.
+            req.close(ClosedSessionException.get());
+            // XXX(trustin): Should we allow aborting with an exception other than AbortedStreamException?
+            //               (ClosedSessionException in this case.)
+            res.abort();
+        });
     }
 
     @Override
@@ -258,12 +272,28 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
             protocol = H2C;
         }
 
-        final Http2ConnectionHandler handler = ctx.pipeline().get(Http2ConnectionHandler.class);
+        final ChannelPipeline pipeline = ctx.pipeline();
+        final Http2ConnectionHandler handler = pipeline.get(Http2ConnectionHandler.class);
         if (responseEncoder == null) {
-            responseEncoder = new Http2ObjectEncoder(handler.encoder());
+            responseEncoder = new Http2ObjectEncoder(ctx, handler.encoder());
         } else if (responseEncoder instanceof Http1ObjectEncoder) {
             responseEncoder.close();
-            responseEncoder = new Http2ObjectEncoder(handler.encoder());
+            responseEncoder = new Http2ObjectEncoder(ctx, handler.encoder());
+        }
+
+        // Update the connection-level flow-control window size.
+        final int initialWindow = config.http2InitialConnectionWindowSize();
+        if (initialWindow > DEFAULT_WINDOW_SIZE) {
+            incrementLocalWindowSize(pipeline, initialWindow - DEFAULT_WINDOW_SIZE);
+        }
+    }
+
+    private static void incrementLocalWindowSize(ChannelPipeline pipeline, int delta) {
+        try {
+            final Http2Connection connection = pipeline.get(Http2ServerConnectionHandler.class).connection();
+            connection.local().flowController().incrementWindowSize(connection.connectionStream(), delta);
+        } catch (Http2Exception e) {
+            logger.warn("Failed to increment local flowController window size: {}", delta, e);
         }
     }
 
@@ -281,31 +311,19 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         }
 
         final HttpHeaders headers = req.headers();
-        final String methodName = headers.get(HttpHeaderNames.METHOD);
-        if (methodName == null) {
-            respond(ctx, req, HttpStatus.BAD_REQUEST,
-                    new IllegalArgumentException("Method is missing."));
-            return;
-        }
-        if (!ALLOWED_METHOD_NAMES.contains(methodName)) {
-            respond(ctx, req, HttpStatus.METHOD_NOT_ALLOWED,
-                    new IllegalArgumentException("Request method is not allowed: " + methodName));
-            return;
-        }
 
         // Handle 'OPTIONS * HTTP/1.1'.
         final String originalPath = headers.path();
         if (originalPath == null) {
-            respond(ctx, req, HttpStatus.BAD_REQUEST,
-                    new IllegalArgumentException("Request path is missing."));
+            respond(ctx, req, HttpStatus.BAD_REQUEST, DATA_MISSING_REQUEST_PATH,
+                    new ProtocolViolationException(MSG_MISSING_REQUEST_PATH));
             return;
         }
         if (originalPath.isEmpty() || originalPath.charAt(0) != '/') {
             if (headers.method() == HttpMethod.OPTIONS && "*".equals(originalPath)) {
                 handleOptions(ctx, req);
             } else {
-                respond(ctx, req, HttpStatus.BAD_REQUEST,
-                        new IllegalArgumentException("Request path is invalid: " + originalPath));
+                rejectInvalidPath(ctx, req);
             }
             return;
         }
@@ -313,9 +331,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         // Validate and split path and query.
         final PathAndQuery pathAndQuery = PathAndQuery.parse(originalPath);
         if (pathAndQuery == null) {
-            // Reject requests without a valid path.
-            respond(ctx, req, HttpStatus.NOT_FOUND,
-                    new IllegalArgumentException("Request path is invalid: " + originalPath));
+            rejectInvalidPath(ctx, req);
             return;
         }
 
@@ -325,18 +341,18 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
 
         final PathMappingContext mappingCtx = DefaultPathMappingContext.of(
                 host, hostname, pathAndQuery.path(), pathAndQuery.query(), headers,
-                host.producibleMediaTypes());
+                host.producibleMediaTypes(), isCorsPreflightRequest(req));
         // Find the service that matches the path.
         final PathMapped<ServiceConfig> mapped;
         try {
             mapped = host.findServiceConfig(mappingCtx);
         } catch (HttpStatusException cause) {
             // We do not need to handle HttpResponseException here because we do not use it internally.
-            respond(ctx, req, pathAndQuery, cause.httpStatus(), cause);
+            respond(ctx, req, pathAndQuery, cause.httpStatus(), null, cause);
             return;
         } catch (Throwable cause) {
             logger.warn("{} Unexpected exception: {}", ctx.channel(), req, cause);
-            respond(ctx, req, pathAndQuery, HttpStatus.INTERNAL_SERVER_ERROR, cause);
+            respond(ctx, req, pathAndQuery, HttpStatus.INTERNAL_SERVER_ERROR, null, cause);
             return;
         }
         if (!mapped.isPresent()) {
@@ -349,11 +365,21 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         final PathMappingResult mappingResult = mapped.mappingResult();
         final ServiceConfig serviceCfg = mapped.value();
         final Service<HttpRequest, HttpResponse> service = serviceCfg.service();
-
         final Channel channel = ctx.channel();
+        final InetAddress remoteAddress = ((InetSocketAddress) channel.remoteAddress()).getAddress();
+
+        final InetAddress clientAddress;
+        if (config.clientAddressTrustedProxyFilter().test(remoteAddress)) {
+            clientAddress = determineClientAddress(headers, config.clientAddressSources(), proxiedAddresses,
+                                                   remoteAddress, config.clientAddressFilter());
+        } else {
+            clientAddress = remoteAddress;
+        }
+
         final DefaultServiceRequestContext reqCtx = new DefaultServiceRequestContext(
                 serviceCfg, channel, serviceCfg.server().meterRegistry(),
-                protocol, mappingCtx, mappingResult, req, getSSLSession(channel), proxiedAddresses);
+                protocol, mappingCtx, mappingResult, req, getSSLSession(channel),
+                proxiedAddresses, clientAddress);
 
         try (SafeCloseable ignored = reqCtx.push()) {
             final RequestLogBuilder logBuilder = reqCtx.logBuilder();
@@ -366,10 +392,10 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
             } catch (Throwable cause) {
                 try {
                     if (cause instanceof HttpStatusException) {
-                        respond(ctx, req, ((HttpStatusException) cause).httpStatus(), reqCtx, cause);
+                        respond(ctx, reqCtx, ((HttpStatusException) cause).httpStatus(), null, cause);
                     } else {
                         logger.warn("{} Unexpected exception: {}, {}", reqCtx, service, req, cause);
-                        respond(ctx, req, HttpStatus.INTERNAL_SERVER_ERROR, reqCtx, cause);
+                        respond(ctx, reqCtx, HttpStatus.INTERNAL_SERVER_ERROR, null, cause);
                     }
                 } finally {
                     logBuilder.endRequest(cause);
@@ -387,8 +413,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
             if (!isTransient) {
                 gracefulShutdownSupport.inc();
             }
-            unfinishedRequests++;
-            unfinishedResponses.put(res, true);
+            unfinishedRequests.put(req, res);
 
             if (service.shouldCachePath(pathAndQuery.path(), pathAndQuery.query(), mapped.mapping())) {
                 reqCtx.log().addListener(log -> {
@@ -399,26 +424,32 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
                 }, RequestLogAvailability.COMPLETE);
             }
 
-            req.completionFuture().handle(voidFunction((ret, cause) -> {
+            req.completionFuture().handle((ret, cause) -> {
                 if (cause == null) {
                     logBuilder.endRequest();
                 } else {
                     logBuilder.endRequest(cause);
                     // NB: logBuilder.endResponse(cause) will be called by HttpResponseSubscriber below
                 }
-            })).exceptionally(CompletionActions::log);
+                return null;
+            }).exceptionally(CompletionActions::log);
 
-            res.completionFuture().handleAsync(voidFunction((ret, cause) -> {
+            res.completionFuture().handleAsync((ret, cause) -> {
                 req.abort();
                 // NB: logBuilder.endResponse() is called by HttpResponseSubscriber below.
                 if (!isTransient) {
                     gracefulShutdownSupport.dec();
                 }
-                unfinishedResponses.remove(res);
-                if (--unfinishedRequests == 0 && handledLastRequest) {
+                unfinishedRequests.remove(req);
+                if (unfinishedRequests.isEmpty() && handledLastRequest) {
                     ctx.writeAndFlush(Unpooled.EMPTY_BUFFER).addListener(CLOSE);
                 }
-            }), eventLoop).exceptionally(CompletionActions::log);
+                return null;
+            }, eventLoop).exceptionally(CompletionActions::log);
+
+            // Set the response to the request in order to be able to immediately abort the response
+            // when the peer cancels the stream.
+            req.setResponse(res);
 
             assert responseEncoder != null;
             final HttpResponseSubscriber resSubscriber =
@@ -429,11 +460,17 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
     }
 
     private void handleOptions(ChannelHandlerContext ctx, DecodedHttpRequest req) {
-        respond(ctx, req,
-                AggregatedHttpMessage.of(
-                        HttpHeaders.of(HttpStatus.OK)
-                                   .set(HttpHeaderNames.ALLOW, ALLOWED_METHODS_STRING)),
-                newEarlyRespondingRequestContext(ctx, req, req.path(), null), null);
+        respond(ctx,
+                newEarlyRespondingRequestContext(ctx, req, req.path(), null),
+                HttpHeaders.of(HttpStatus.OK)
+                           .set(HttpHeaderNames.ALLOW, ALLOWED_METHODS_STRING),
+                null, null);
+    }
+
+    private void rejectInvalidPath(ChannelHandlerContext ctx, DecodedHttpRequest req) {
+        // Reject requests without a valid path.
+        respond(ctx, req, HttpStatus.BAD_REQUEST, DATA_INVALID_REQUEST_PATH,
+                new ProtocolViolationException(MSG_INVALID_REQUEST_PATH));
     }
 
     private void handleNonExistentMapping(ChannelHandlerContext ctx, DecodedHttpRequest req,
@@ -457,7 +494,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
             }
         }
 
-        respond(ctx, req, HttpStatus.NOT_FOUND, null);
+        respond(ctx, req, HttpStatus.NOT_FOUND, null, null);
     }
 
     private void fillSchemeIfMissing(HttpHeaders headers) {
@@ -487,59 +524,53 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
 
     private void redirect(ChannelHandlerContext ctx, DecodedHttpRequest req,
                           PathAndQuery pathAndQuery, String location) {
-        respond(ctx, req,
-                AggregatedHttpMessage.of(
-                        HttpHeaders.of(HttpStatus.TEMPORARY_REDIRECT)
-                                   .set(HttpHeaderNames.LOCATION, location)),
+        respond(ctx,
                 newEarlyRespondingRequestContext(ctx, req, pathAndQuery.path(), pathAndQuery.query()),
-                null);
+                HttpHeaders.of(HttpStatus.TEMPORARY_REDIRECT)
+                           .set(HttpHeaderNames.LOCATION, location),
+                null, null);
     }
 
     private void respond(ChannelHandlerContext ctx, DecodedHttpRequest req,
-                         HttpStatus status, @Nullable Throwable cause) {
-        respond(ctx, req, status,
-                newEarlyRespondingRequestContext(ctx, req, req.path(), null), cause);
+                         HttpStatus status, @Nullable HttpData resContent, @Nullable Throwable cause) {
+        respond(ctx, newEarlyRespondingRequestContext(ctx, req, req.path(), null),
+                status, resContent, cause);
     }
 
     private void respond(ChannelHandlerContext ctx, DecodedHttpRequest req, PathAndQuery pathAndQuery,
-                         HttpStatus status, @Nullable Throwable cause) {
-        respond(ctx, req, status,
-                newEarlyRespondingRequestContext(ctx, req, pathAndQuery.path(), pathAndQuery.query()), cause);
+                         HttpStatus status, @Nullable HttpData resContent, @Nullable Throwable cause) {
+        respond(ctx, newEarlyRespondingRequestContext(ctx, req, pathAndQuery.path(), pathAndQuery.query()),
+                status, resContent, cause);
     }
 
-    private void respond(ChannelHandlerContext ctx, DecodedHttpRequest req, HttpStatus status,
-                         RequestContext reqCtx, @Nullable Throwable cause) {
+    private void respond(ChannelHandlerContext ctx, RequestContext reqCtx,
+                         HttpStatus status, @Nullable HttpData resContent, @Nullable Throwable cause) {
 
         if (status.code() < 400) {
-            respond(ctx, req, AggregatedHttpMessage.of(HttpHeaders.of(status)), reqCtx, cause);
+            respond(ctx, reqCtx, HttpHeaders.of(status), null, cause);
             return;
         }
 
-        final HttpData content;
-        if (req.method() == HttpMethod.HEAD || ArmeriaHttpUtil.isContentAlwaysEmpty(status)) {
-            content = HttpData.EMPTY_DATA;
+        if (reqCtx.method() == HttpMethod.HEAD || ArmeriaHttpUtil.isContentAlwaysEmpty(status)) {
+            resContent = null;
+        } else if (resContent == null) {
+            resContent = status.toHttpData();
         } else {
-            content = status.toHttpData();
+            assert !resContent.isEmpty();
         }
 
-        respond(ctx, req,
-                AggregatedHttpMessage.of(
-                        HttpHeaders.of(status)
-                                   .contentType(ERROR_CONTENT_TYPE),
-                        content), reqCtx, cause);
+        respond(ctx, reqCtx,
+                HttpHeaders.of(status)
+                           .contentType(ERROR_CONTENT_TYPE),
+                resContent, cause);
     }
 
-    private void respond(ChannelHandlerContext ctx, DecodedHttpRequest req, AggregatedHttpMessage res,
-                         RequestContext reqCtx, @Nullable Throwable cause) {
+    private void respond(ChannelHandlerContext ctx, RequestContext reqCtx,
+                         HttpHeaders resHeaders, @Nullable HttpData resContent, @Nullable Throwable cause) {
         if (!handledLastRequest) {
-            addKeepAliveHeaders(req, res);
-            respond0(ctx, req, res, reqCtx, cause).addListener(CLOSE_ON_FAILURE);
+            respond0(reqCtx, true, resHeaders, resContent, cause).addListener(CLOSE_ON_FAILURE);
         } else {
-            // Note that it is perfectly fine not to set the 'content-length' header to the last response
-            // of an HTTP/1 connection. We set it anyway to work around overly strict HTTP clients that always
-            // require a 'content-length' header for non-chunked responses.
-            setContentLength(req, res);
-            respond0(ctx, req, res, reqCtx, cause).addListener(CLOSE);
+            respond0(reqCtx, false, resHeaders, resContent, cause).addListener(CLOSE);
         }
 
         if (!isReading) {
@@ -547,31 +578,36 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         }
     }
 
-    private ChannelFuture respond0(ChannelHandlerContext ctx,
-                                   DecodedHttpRequest req, AggregatedHttpMessage res,
-                                   RequestContext reqCtx, @Nullable Throwable cause) {
+    private ChannelFuture respond0(
+            RequestContext reqCtx, boolean addKeepAlive,
+            HttpHeaders resHeaders, @Nullable HttpData resContent, @Nullable Throwable cause) {
+
+        assert resContent == null || !resContent.isEmpty() : resContent;
 
         // No need to consume further since the response is ready.
+        final DecodedHttpRequest req = reqCtx.request();
         req.close();
 
-        final boolean trailingHeadersEmpty = res.trailingHeaders().isEmpty();
-        final boolean contentAndTrailingHeadersEmpty = res.content().isEmpty() && trailingHeadersEmpty;
-
+        final boolean hasContent = resContent != null;
         final RequestLogBuilder logBuilder = reqCtx.logBuilder();
 
         logBuilder.startResponse();
         assert responseEncoder != null;
+        final HttpHeaders mutableHeaders = resHeaders.toMutable();
+        if (addKeepAlive) {
+            addKeepAliveHeaders(mutableHeaders);
+        }
+        // Note that it is perfectly fine not to set the 'content-length' header to the last response
+        // of an HTTP/1 connection. We set it anyway to work around overly strict HTTP clients that always
+        // require a 'content-length' header for non-chunked responses.
+        setContentLength(req, mutableHeaders, hasContent ? resContent.length() : 0);
+
         ChannelFuture future = responseEncoder.writeHeaders(
-                ctx, req.id(), req.streamId(), res.headers(), contentAndTrailingHeadersEmpty);
-        logBuilder.responseHeaders(res.headers());
-        if (!contentAndTrailingHeadersEmpty) {
-            future = responseEncoder.writeData(
-                    ctx, req.id(), req.streamId(), res.content(), trailingHeadersEmpty);
-            logBuilder.increaseResponseLength(res.content().length());
-            if (!trailingHeadersEmpty) {
-                future = responseEncoder.writeHeaders(
-                        ctx, req.id(), req.streamId(), res.trailingHeaders(), true);
-            }
+                req.id(), req.streamId(), mutableHeaders, !hasContent);
+        logBuilder.responseHeaders(mutableHeaders);
+        if (hasContent) {
+            future = responseEncoder.writeData(req.id(), req.streamId(), resContent, true);
+            logBuilder.increaseResponseLength(resContent);
         }
 
         future.addListener(f -> {
@@ -581,7 +617,7 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
                 // Respect the first specified cause.
                 logBuilder.endResponse(firstNonNull(cause, f.cause()));
             }
-            reqCtx.log().addListener(accessLogWriter::accept, RequestLogAvailability.COMPLETE);
+            reqCtx.log().addListener(accessLogWriter::log, RequestLogAvailability.COMPLETE);
         });
         return future;
     }
@@ -590,28 +626,26 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
      * Sets the keep alive header as per:
      * - https://www.w3.org/Protocols/HTTP/1.1/draft-ietf-http-v11-spec-01.html#Connection
      */
-    private void addKeepAliveHeaders(HttpRequest req, AggregatedHttpMessage res) {
+    private void addKeepAliveHeaders(HttpHeaders headers) {
         if (protocol == H1 || protocol == H1C) {
-            res.headers().set(HttpHeaderNames.CONNECTION, "keep-alive");
+            headers.set(HttpHeaderNames.CONNECTION, "keep-alive");
         } else {
             // Do not add the 'connection' header for HTTP/2 responses.
             // See https://tools.ietf.org/html/rfc7540#section-8.1.2.2
         }
-
-        setContentLength(req, res);
     }
 
     /**
      * Sets the 'content-length' header to the response.
      */
-    private static void setContentLength(HttpRequest req, AggregatedHttpMessage res) {
+    private static void setContentLength(HttpRequest req, HttpHeaders headers, int contentLength) {
         // https://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.4
         // prohibits to send message body for below cases.
         // and in those cases, content should be empty.
-        if (req.method() == HttpMethod.HEAD || ArmeriaHttpUtil.isContentAlwaysEmpty(res.status())) {
+        if (req.method() == HttpMethod.HEAD || ArmeriaHttpUtil.isContentAlwaysEmpty(headers.status())) {
             return;
         }
-        res.headers().setInt(HttpHeaderNames.CONTENT_LENGTH, res.content().length());
+        headers.setInt(HttpHeaderNames.CONTENT_LENGTH, contentLength);
     }
 
     @Nullable
@@ -689,6 +723,12 @@ final class HttpServerHandler extends ChannelInboundHandlerAdapter implements Ht
         @Override
         protected Channel channel() {
             return channel;
+        }
+
+        @Nullable
+        @Override
+        public SSLSession sslSession() {
+            return ChannelUtil.findSslSession(channel);
         }
 
         @Override

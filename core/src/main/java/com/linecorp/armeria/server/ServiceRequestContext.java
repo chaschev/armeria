@@ -16,6 +16,8 @@
 
 package com.linecorp.armeria.server;
 
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.Map;
@@ -35,6 +37,7 @@ import com.linecorp.armeria.common.HttpStatus;
 import com.linecorp.armeria.common.MediaType;
 import com.linecorp.armeria.common.Request;
 import com.linecorp.armeria.common.RequestContext;
+import com.linecorp.armeria.common.Response;
 
 import io.netty.handler.codec.Headers;
 import io.netty.util.AsciiString;
@@ -44,6 +47,18 @@ import io.netty.util.AsciiString;
  * {@link ServiceRequestContext} instance.
  */
 public interface ServiceRequestContext extends RequestContext {
+
+    /**
+     * Returns a new {@link ServiceRequestContext} created from the specified {@link HttpRequest}.
+     * Note that it is not usually required to create a new context by yourself, because Armeria
+     * will always provide a context object for you. However, it may be useful in some cases such as
+     * unit testing.
+     *
+     * @see ServiceRequestContextBuilder
+     */
+    static ServiceRequestContext of(HttpRequest request) {
+        return ServiceRequestContextBuilder.of(request).build();
+    }
 
     /**
      * Returns the remote address of this request.
@@ -58,6 +73,14 @@ public interface ServiceRequestContext extends RequestContext {
     @Nonnull
     @Override
     <A extends SocketAddress> A localAddress();
+
+    /**
+     * Returns the address of the client who initiated this request.
+     */
+    default InetAddress clientAddress() {
+        final InetSocketAddress remoteAddress = remoteAddress();
+        return remoteAddress.getAddress();
+    }
 
     @Override
     ServiceRequestContext newDerivedContext();
@@ -116,10 +139,16 @@ public interface ServiceRequestContext extends RequestContext {
     ExecutorService blockingTaskExecutor();
 
     /**
-     * Returns the path with its context path removed. This method can be useful for a reusable service bound
-     * at various path prefixes.
+     * Returns the {@link #path()} with its context path removed. This method can be useful for a reusable
+     * service bound at various path prefixes.
      */
     String mappedPath();
+
+    /**
+     * Returns the {@link #decodedPath()} with its context path removed. This method can be useful for
+     * a reusable service bound at various path prefixes.
+     */
+    String decodedMappedPath();
 
     /**
      * Returns the negotiated producible media type. If the media type negotiation is not used for the
@@ -150,19 +179,22 @@ public interface ServiceRequestContext extends RequestContext {
     Logger logger();
 
     /**
-     * Returns the amount of time allowed until receiving the current {@link Request} completely.
+     * Returns the amount of time allowed until receiving the current {@link Request} and sending
+     * the corresponding {@link Response} completely.
      * This value is initially set from {@link ServerConfig#defaultRequestTimeoutMillis()}.
      */
     long requestTimeoutMillis();
 
     /**
-     * Sets the amount of time allowed until receiving the current {@link Request} completely.
+     * Sets the amount of time allowed until receiving the current {@link Request} and sending
+     * the corresponding {@link Response} completely.
      * This value is initially set from {@link ServerConfig#defaultRequestTimeoutMillis()}.
      */
     void setRequestTimeoutMillis(long requestTimeoutMillis);
 
     /**
-     * Sets the amount of time allowed until receiving the current {@link Request} completely.
+     * Sets the amount of time allowed until receiving the current {@link Request} and sending
+     * the corresponding {@link Response} completely.
      * This value is initially set from {@link ServerConfig#defaultRequestTimeoutMillis()}.
      */
     void setRequestTimeout(Duration requestTimeout);
@@ -183,6 +215,13 @@ public interface ServiceRequestContext extends RequestContext {
      * }</pre>
      */
     void setRequestTimeoutHandler(Runnable requestTimeoutHandler);
+
+    /**
+     * Returns whether this {@link ServiceRequestContext} has been timed-out (e.g., when the
+     * corresponding request passes a deadline).
+     */
+    @Override
+    boolean isTimedOut();
 
     /**
      * Returns the maximum length of the current {@link Request}.
@@ -239,6 +278,44 @@ public interface ServiceRequestContext extends RequestContext {
      * @return {@code true} if at least one entry has been removed
      */
     boolean removeAdditionalResponseHeader(AsciiString name);
+
+    /**
+     * Returns an immutable {@link HttpHeaders} which is returned along with any other trailers when a
+     * {@link Service} completes an {@link HttpResponse}.
+     */
+    HttpHeaders additionalResponseTrailers();
+
+    /**
+     * Sets a trailer with the specified {@code name} and {@code value}. This will remove all previous values
+     * associated with the specified {@code name}.
+     * The trailer will be included when a {@link Service} completes an {@link HttpResponse}.
+     */
+    void setAdditionalResponseTrailer(AsciiString name, String value);
+
+    /**
+     * Clears the current trailer and sets the specified {@link Headers} which is included when a
+     * {@link Service} completes an {@link HttpResponse}.
+     */
+    void setAdditionalResponseTrailers(Headers<? extends AsciiString, ? extends String, ?> headers);
+
+    /**
+     * Adds a trailer with the specified {@code name} and {@code value}. The trailer will be included when
+     * a {@link Service} completes an {@link HttpResponse}.
+     */
+    void addAdditionalResponseTrailer(AsciiString name, String value);
+
+    /**
+     * Adds the specified {@link Headers} which is included when a {@link Service} completes an
+     * {@link HttpResponse}.
+     */
+    void addAdditionalResponseTrailers(Headers<? extends AsciiString, ? extends String, ?> headers);
+
+    /**
+     * Removes all trailers with the specified {@code name}.
+     *
+     * @return {@code true} if at least one entry has been removed
+     */
+    boolean removeAdditionalResponseTrailer(AsciiString name);
 
     /**
      * Returns the proxied addresses if the current {@link Request} is received through a proxy.
