@@ -25,6 +25,7 @@ import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
@@ -82,7 +83,7 @@ import io.netty.util.AsciiString;
  * Encapsulates the state of a single server call, reading messages from the client, passing to business logic
  * via {@link ServerCall.Listener}, and writing messages passed back to the response.
  */
-class ArmeriaServerCall<I, O> extends ServerCall<I, O>
+public class ArmeriaServerCall<I, O> extends ServerCall<I, O>
         implements ArmeriaMessageDeframer.Listener, TransportStatusListener {
 
     private static final Logger logger = LoggerFactory.getLogger(ArmeriaServerCall.class);
@@ -103,6 +104,10 @@ class ArmeriaServerCall<I, O> extends ServerCall<I, O>
 
     private final HttpStreamReader messageReader;
     private final ArmeriaMessageFramer messageFramer;
+
+    private final HttpHeaders requestHeaders;
+
+    private Map<String, Object> storage = null;
 
     private final HttpResponseWriter res;
     private final CompressorRegistry compressorRegistry;
@@ -150,6 +155,7 @@ class ArmeriaServerCall<I, O> extends ServerCall<I, O>
         requireNonNull(clientHeaders, "clientHeaders");
         this.method = requireNonNull(method, "method");
         this.ctx = requireNonNull(ctx, "ctx");
+        this.requestHeaders = clientHeaders;
         this.serializationFormat = requireNonNull(serializationFormat, "serializationFormat");
         messageReader = new HttpStreamReader(
                 requireNonNull(decompressorRegistry, "decompressorRegistry"),
@@ -406,6 +412,10 @@ class ArmeriaServerCall<I, O> extends ServerCall<I, O>
         closeListener(status);
     }
 
+    public HttpHeaders getRequestHeaders() {
+        return requestHeaders;
+    }
+
     private void closeListener(Status newStatus) {
         if (!listenerClosed) {
             listenerClosed = true;
@@ -532,5 +542,18 @@ class ArmeriaServerCall<I, O> extends ServerCall<I, O>
         for (int i = 0; i < valueLen; ++i) {
             buf.setByte(offset++, c2b(value.charAt(i)));
         }
+    }
+
+    public Map<String, Object> getStorage() {
+        if(storage != null) return storage;
+
+        //for the sake of... multi purpose :-)
+        synchronized (this) {
+            if(storage == null) {
+                storage = new HashMap<>();
+            }
+        }
+
+        return storage;
     }
 }
